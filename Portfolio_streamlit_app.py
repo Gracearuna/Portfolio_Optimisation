@@ -534,6 +534,6 @@ with tab7:
         st.pyplot(fig6)
 
 # Footer note
-st.caption("Note: This app uses ML-forecasted returns (Random Forest with lag features), Ledoit–Wolf covariance, \n"
+#st.caption("Note: This app uses ML-forecasted returns (Random Forest with lag features), Ledoit–Wolf covariance, \n"
            "MVO and Max Sharpe optimization (long-only, 20% cap for Max Sharpe), and a basic Black–Litterman setup.\n"
            "Data source: Yahoo Finance; Risk-free rate: FRED DGS5 (fallback 2%).")
