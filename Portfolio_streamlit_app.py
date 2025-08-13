@@ -327,7 +327,7 @@ with tab2:
     st.pyplot(fig)
 
 with tab3:
-    st.subheader("Walk-Forward Backtest: Cumulative Returns & Drawdowns")
+    st.subheader("Cumulative Returns & Drawdowns")
 
     lookback_period = pd.DateOffset(years=lookback_years)
     rebalance_frequency = pd.DateOffset(months=rebalance_months)
