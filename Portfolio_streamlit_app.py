@@ -120,7 +120,7 @@ def optimize_portfolio(mu, Sigma, rf, max_variance=0.0002):
     Sigma = np.asarray(Sigma, dtype=float)
     Sigma_psd = _nearest_psd(Sigma)
 
-    # MVO
+    # MVO: Maximize return under risk constraint
     w_mvo = cp.Variable(n)
     portfolio_return = mu @ w_mvo
     portfolio_variance = cp.quad_form(w_mvo, Sigma_psd)
@@ -132,7 +132,7 @@ def optimize_portfolio(mu, Sigma, rf, max_variance=0.0002):
     except Exception:
         weights_mvo = np.repeat(1/n, n)
 
-    # Max Sharpe
+    # Max Sharpe (SLSQP with 20% cap)
     def neg_sharpe(w):
         ret = float(np.dot(w, mu))
         vol = float(np.sqrt(np.dot(w.T, np.dot(Sigma_psd, w))))
@@ -200,6 +200,17 @@ def get_portfolio_perf(weights, mu, Sigma, rf):
     sharpe = (port_return - rf) / (port_vol + 1e-12)
     return port_return, port_vol, sharpe
 
+def min_variance(Sigma):
+    n = Sigma.shape[0]
+    constraints = ({'type': 'eq', 'fun': lambda x: np.sum(x) - 1})
+    bounds = tuple((0, 1) for _ in range(n))
+    result = minimize(lambda w: np.dot(w.T, np.dot(Sigma, w)),
+                      x0=np.ones(n)/n,
+                      method='SLSQP',
+                      bounds=bounds,
+                      constraints=constraints)
+    return result.x
+
 def efficient_frontier_curve(mu, Sigma, points=100):
     n = len(mu)
     frontier_vols = []
@@ -218,20 +229,26 @@ def efficient_frontier_curve(mu, Sigma, points=100):
         frontier_vols.append(result.fun if result.success else np.nan)
     return target_returns, np.array(frontier_vols)
 
+# --------------------------
+# Safe align_weights function
+# --------------------------
 def align_weights(weights, master, active):
     aligned = []
     for t in active:
         if t in master:
             aligned.append(weights[master.index(t)])
         else:
-            # fallback: equally distribute for tickers missing in master
-            aligned.append(1.0 / len(active))
-    return np.array(aligned)
+            aligned.append(0.0)
+    aligned = np.array(aligned)
+    if aligned.sum() > 0:
+        aligned /= aligned.sum()
+    else:
+        aligned = np.repeat(1.0/len(active), len(active))
+    return aligned
 
-
-# --------------------------------
+# --------------------------
 # Data Pipeline
-# --------------------------------
+# --------------------------
 if len(tickers) == 0:
     st.warning("Please select at least one ticker.")
     st.stop()
@@ -241,9 +258,6 @@ if prices.empty:
     st.error("No price data returned. Try different dates or tickers.")
     st.stop()
 
-# Only keep active tickers with price data
-active_tickers = list(prices.columns)
-
 returns = resample_returns(prices, frequency)
 rf_annual = get_rf_series(start, end)
 rf = rf_annual / FREQUENCY_MAP[frequency]['rf_divisor']
@@ -252,20 +266,14 @@ mu = predict_returns(returns, n_lags)
 Sigma = LedoitWolf().fit(returns).covariance_
 
 w_mvo, w_sharpe = optimize_portfolio(mu, Sigma, rf, max_variance)
-w_eq = np.repeat(1/len(active_tickers), len(active_tickers))
-mu_bl, w_bl = black_litterman(mu, Sigma, rf, active_tickers, returns, tau, omega_scalar)
+w_eq = equal_weight_portfolio(len(mu))
+mu_bl, w_bl = black_litterman(mu, Sigma, rf, tickers, returns, tau, omega_scalar)
 
-# Align weights to active tickers
-w_mvo = align_weights(w_mvo, tickers, active_tickers)
-w_sharpe = align_weights(w_sharpe, tickers, active_tickers)
-w_bl = align_weights(w_bl, tickers, active_tickers)
-
-# --------------------------------
-# Tabs
-# --------------------------------
+# --------------------------
+# Tabs for Outputs
+# --------------------------
 tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
-    ["Weights", "Efficient Frontier", "Cumulative Returns & Drawdowns", 
-     "Metrics", "Rolling", "Correlation", "VaR & CVaR"]
+    ["Weights", "Efficient Frontier", "Cumulative Returns & Drawdowns", "Metrics", "Rolling", "Correlation", "VaR & CVaR"]
 )
 
 # --------------------------
@@ -274,7 +282,7 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
 with tab1:
     st.subheader("Optimized Portfolio Weights")
     weights_df = pd.DataFrame({
-        "Ticker": active_tickers,
+        "Ticker": tickers,
         "Equal Weight": w_eq,
         "MVO": w_mvo,
         "Max Sharpe": w_sharpe,
@@ -284,47 +292,3 @@ with tab1:
 
     csv = weights_df.to_csv(index=False).encode('utf-8')
     st.download_button("Download Weights CSV", data=csv, file_name="weights.csv", mime="text/csv")
-
-# --------------------------
-# Tab 2: Efficient Frontier
-# --------------------------
-with tab2:
-    st.subheader("Efficient Frontier & Random Portfolios")
-    n = len(mu)
-    num_portfolios = 3000
-    results = np.zeros((3, num_portfolios))
-    Sigma_psd = _nearest_psd(Sigma)
-    for i in range(num_portfolios):
-        w = np.random.dirichlet(np.ones(n))
-        r, v, s = get_portfolio_perf(w, mu, Sigma_psd, rf)
-        results[:, i] = [r, v, s]
-
-    frontier_returns, frontier_vols = efficient_frontier_curve(mu, Sigma_psd)
-    fig, ax = plt.subplots(figsize=(10, 6))
-    sc = ax.scatter(results[1, :], results[0, :], c=results[2, :], cmap='viridis', alpha=0.5, label='Random Portfolios')
-    if np.isfinite(frontier_vols).any():
-        ax.plot(frontier_vols, frontier_returns, 'r--', linewidth=2, label='Efficient Frontier')
-
-    portfolios = {
-        "Equal Weight": w_eq,
-        "Max Sharpe": w_sharpe,
-        "MVO": w_mvo,
-        "Black-Litterman": w_bl,
-    }
-    for label, w in portfolios.items():
-        r, v, s = get_portfolio_perf(w, mu, Sigma_psd, rf)
-        ax.scatter(v, r, marker='X', s=160, label=f"{label} (Sharpe: {s:.2f})")
-
-    ax.set_xlabel('Volatility (Std Dev)')
-    ax.set_ylabel('Expected Return')
-    ax.set_title(f"{frequency.title()} Efficient Frontier (ML Forecasted Returns)")
-    ax.grid(True, linestyle='--', alpha=0.5)
-    ax.legend()
-    cbar = plt.colorbar(sc)
-    cbar.set_label('Sharpe Ratio')
-    st.pyplot(fig)
-
-# --------------------------
-# Remaining tabs (Tab3-7)
-# --------------------------
-# I can provide the remaining tabs fully implemented next, including backtest and metrics.
