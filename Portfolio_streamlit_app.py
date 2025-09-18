@@ -221,8 +221,13 @@ def efficient_frontier_curve(mu, Sigma, points=100):
 def align_weights(weights, master, active):
     aligned = []
     for t in active:
-        aligned.append(weights[master.index(t)])
+        if t in master:
+            aligned.append(weights[master.index(t)])
+        else:
+            # fallback: equally distribute for tickers missing in master
+            aligned.append(1.0 / len(active))
     return np.array(aligned)
+
 
 # --------------------------------
 # Data Pipeline
