@@ -196,43 +196,6 @@ def black_litterman(mu_view, Sigma, rf, tickers, returns, tau=0.2, omega_scalar=
 
     return post_mean, w_bl
 
-# Performance utilities
-
-def get_portfolio_perf(weights, mu, Sigma, rf):
-    port_return = float(np.dot(weights, mu))
-    port_vol = float(np.sqrt(np.dot(weights.T, np.dot(Sigma, weights))))
-    sharpe = (port_return - rf) / (port_vol + 1e-12)
-    return port_return, port_vol, sharpe
-
-def min_variance(Sigma):
-    n = Sigma.shape[0]
-    constraints = ({'type': 'eq', 'fun': lambda x: np.sum(x) - 1})
-    bounds = tuple((0, 1) for _ in range(n))
-    result = minimize(lambda w: np.dot(w.T, np.dot(Sigma, w)),
-                      x0=np.ones(n)/n,
-                      method='SLSQP',
-                      bounds=bounds,
-                      constraints=constraints)
-    return result.x
-
-def efficient_frontier_curve(mu, Sigma, points=100):
-    n = len(mu)
-    frontier_vols = []
-    target_returns = np.linspace(min(mu), max(mu), points)
-    bounds = tuple((0, 1) for _ in range(n))
-    base_constraint = {'type': 'eq', 'fun': lambda x: np.sum(x) - 1}
-
-    for target in target_returns:
-        constraints = [base_constraint,
-                       {'type': 'eq', 'fun': lambda x, t=target: np.dot(x, mu) - t}]
-        result = minimize(lambda w: np.sqrt(np.dot(w.T, np.dot(Sigma, w))),
-                          x0=np.ones(n)/n,
-                          method='SLSQP',
-                          bounds=bounds,
-                          constraints=constraints)
-        frontier_vols.append(result.fun if result.success else np.nan)
-    return target_returns, np.array(frontier_vols)
-
 # --------------------------------
 # Data Pipeline
 # --------------------------------
@@ -246,27 +209,15 @@ if prices.empty:
     st.stop()
 
 returns = resample_returns(prices, frequency)
-if returns.empty:
-    st.error("No returns after resampling. Adjust date range, frequency or tickers.")
-    st.stop()
-
-# Align tickers to those that have data after resampling
-active_tickers = list(returns.columns)
-dropped_tickers = [tk for tk in tickers if tk not in active_tickers]
-if dropped_tickers:
-    st.warning(f"The following tickers had no data after resampling and were dropped: {', '.join(dropped_tickers)}")
-
 rf_annual = get_rf_series(start, end)
 rf = rf_annual / FREQUENCY_MAP[frequency]['rf_divisor']
 
-# compute mu/Sigma based on the available returns
 mu = predict_returns(returns, n_lags)
 Sigma = LedoitWolf().fit(returns).covariance_
 
 w_mvo, w_sharpe = optimize_portfolio(mu, Sigma, rf, max_variance)
 w_eq = equal_weight_portfolio(len(mu))
-# pass active_tickers (same universe used to build mu/Sigma)
-mu_bl, w_bl = black_litterman(mu, Sigma, rf, active_tickers, returns, tau, omega_scalar)
+mu_bl, w_bl = black_litterman(mu, Sigma, rf, tickers, returns, tau, omega_scalar)
 
 # --------------------------------
 # Tabs for Outputs
@@ -275,282 +226,34 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
     ["Weights", "Efficient Frontier", "Cumulative Returns & Drawdowns", "Metrics", "Rolling", "Correlation", "VaR & CVaR"]
 )
 
+# --- TAB 1: Portfolio Weights ---
 with tab1:
     st.subheader("Optimized Portfolio Weights")
+    master_tickers = returns.columns.tolist()
+    n_master = len(master_tickers)
+
+    def align_weights(weights, active, master):
+        aligned = []
+        for t in master:
+            if t in active:
+                aligned.append(weights[active.index(t)])
+            else:
+                aligned.append(0.0)
+        return np.array(aligned)
+
+    w_mvo_aligned = align_weights(w_mvo, tickers, master_tickers)
+    w_sharpe_aligned = align_weights(w_sharpe, tickers, master_tickers)
+    w_eq_aligned = equal_weight_portfolio(n_master)
+    w_bl_aligned = align_weights(w_bl, tickers, master_tickers)
+
     weights_df = pd.DataFrame({
-        "Ticker": active_tickers,
-        "Equal Weight": w_eq,
-        "MVO": w_mvo,
-        "Max Sharpe": w_sharpe,
-        "Black–Litterman": w_bl
+        "Ticker": master_tickers,
+        "Equal Weight": w_eq_aligned,
+        "MVO": w_mvo_aligned,
+        "Max Sharpe": w_sharpe_aligned,
+        "Black–Litterman": w_bl_aligned
     })
     st.dataframe(weights_df.set_index("Ticker"))
 
     csv = weights_df.to_csv(index=False).encode('utf-8')
     st.download_button("Download Weights CSV", data=csv, file_name="weights.csv", mime="text/csv")
-
-with tab2:
-    st.subheader("Efficient Frontier & Random Portfolios")
-    n = len(mu)
-
-    # Random portfolios scatter
-    num_portfolios = 3000
-    results = np.zeros((3, num_portfolios))
-    Sigma_psd = _nearest_psd(Sigma)
-    for i in range(num_portfolios):
-        w = np.random.dirichlet(np.ones(n))
-        r, v, s = get_portfolio_perf(w, mu, Sigma_psd, rf)
-        results[:, i] = [r, v, s]
-
-    frontier_returns, frontier_vols = efficient_frontier_curve(mu, Sigma_psd)
-
-    fig, ax = plt.subplots(figsize=(10, 6))
-    sc = ax.scatter(results[1, :], results[0, :], c=results[2, :], cmap='viridis', alpha=0.5, label='Random Portfolios')
-    if np.isfinite(frontier_vols).any():
-        ax.plot(frontier_vols, frontier_returns, 'r--', linewidth=2, label='Efficient Frontier')
-
-    # Mark specific portfolios
-    portfolios = {
-        "Equal Weight": w_eq,
-        "Max Sharpe": w_sharpe,
-        "MVO": w_mvo,
-        "Black-Litterman": w_bl,
-    }
-    for label, w in portfolios.items():
-        r, v, s = get_portfolio_perf(w, mu, Sigma_psd, rf)
-        ax.scatter(v, r, marker='X', s=160, label=f"{label} (Sharpe: {s:.2f})")
-
-    ax.set_xlabel('Volatility (Std Dev)')
-    ax.set_ylabel('Expected Return')
-    ax.set_title(f"{frequency.title()} Efficient Frontier (ML Forecasted Returns)")
-    ax.grid(True, linestyle='--', alpha=0.5)
-    ax.legend()
-    cbar = plt.colorbar(sc)
-    cbar.set_label('Sharpe Ratio')
-    st.pyplot(fig)
-
-with tab3:
-    st.subheader("Cumulative Returns & Drawdowns")
-
-    lookback_period = pd.DateOffset(years=lookback_years)
-    rebalance_frequency = pd.DateOffset(months=rebalance_months)
-
-    start_date = pd.to_datetime(start)
-    end_date = pd.to_datetime(end)
-
-    dates_list = []
-    daily_mvo, daily_maxsharpe, daily_eq, daily_bl = [], [], [], []
-
-    current_start = start_date
-    while True:
-        current_lookback_end = current_start + lookback_period
-        current_out_sample_end = current_lookback_end + lookback_period
-        if current_out_sample_end > end_date:
-            break
-        window_returns = returns.loc[current_start:current_lookback_end]
-        if window_returns.empty or window_returns.shape[0] <= n_lags + 2:
-            current_start += rebalance_frequency
-            continue
-
-        # Use tickers available in this window only
-        active_tickers_t = window_returns.columns.tolist()
-        if len(active_tickers_t) == 0:
-            current_start += rebalance_frequency
-            continue
-
-        mu_t = predict_returns(window_returns, n_lags)
-        Sigma_t = LedoitWolf().fit(window_returns).covariance_
-
-        # pass active_tickers_t into black_litterman to keep shapes consistent
-        mu_bl_t, w_bl_t = black_litterman(mu_t, Sigma_t, rf, active_tickers_t, window_returns, tau, omega_scalar)
-        w_mvo_t, w_sharpe_t = optimize_portfolio(mu_t, Sigma_t, rf, max_variance)
-        w_eq_t = equal_weight_portfolio(len(mu_t))
-
-        out_sample_returns = returns.loc[current_lookback_end + pd.Timedelta(days=1):current_out_sample_end]
-        # If out-of-sample returns have a different ticker set, align by selecting columns present
-        if out_sample_returns.empty:
-            break
-
-        # make sure out_sample_returns columns match the weights' order
-        out_sample_returns_aligned = out_sample_returns[active_tickers_t].dropna(axis=1, how='all')
-        if out_sample_returns_aligned.shape[1] != len(w_mvo_t):
-            # If shapes mismatch for any reason, skip this window
-            current_start += rebalance_frequency
-            continue
-
-        daily_mvo.extend(np.log1p(np.dot(out_sample_returns_aligned.values, w_mvo_t)))
-        daily_maxsharpe.extend(np.log1p(np.dot(out_sample_returns_aligned.values, w_sharpe_t)))
-        daily_eq.extend(np.log1p(np.dot(out_sample_returns_aligned.values, w_eq_t)))
-        daily_bl.extend(np.log1p(np.dot(out_sample_returns_aligned.values, w_bl_t)))
-        dates_list.extend(out_sample_returns_aligned.index)
-        current_start += rebalance_frequency
-
-    if len(dates_list) == 0:
-        st.info("Not enough data for the selected backtest settings.")
-    else:
-        daily_mvo = pd.Series(daily_mvo, index=dates_list, name='MVO')
-        daily_maxsharpe = pd.Series(daily_maxsharpe, index=dates_list, name='Max Sharpe')
-        daily_eq = pd.Series(daily_eq, index=dates_list, name='Equal Weight')
-        daily_bl = pd.Series(daily_bl, index=dates_list, name='Black-Litterman')
-
-        daily_df = pd.concat([daily_mvo, daily_maxsharpe, daily_eq, daily_bl], axis=1)
-
-        # Cumulative returns
-        cumulative = np.exp(daily_df.cumsum())
-        fig1, ax1 = plt.subplots(figsize=(12, 6))
-        for col in cumulative.columns:
-            ax1.plot(cumulative.index, cumulative[col], label=col)
-        ax1.set_title('Portfolio Cumulative Returns')
-        ax1.set_xlabel('Date')
-        ax1.set_ylabel('Cumulative Return')
-        ax1.grid(True, linestyle='--', alpha=0.5)
-        ax1.legend()
-        st.pyplot(fig1)
-
-        # Drawdowns overlay
-        fig2, ax2 = plt.subplots(figsize=(12, 6))
-        for col in cumulative.columns:
-            series = cumulative[col]
-            running_max = series.cummax()
-            drawdown = series / running_max - 1
-            ax2.plot(series.index, series, label=col)
-            ax2.fill_between(series.index, series, running_max, where=drawdown < 0, alpha=0.1)
-        ax2.set_title('Cumulative Returns with Drawdowns')
-        ax2.set_xlabel('Date')
-        ax2.set_ylabel('Cumulative Return')
-        ax2.grid(True, linestyle='--', alpha=0.5)
-        ax2.legend()
-        st.pyplot(fig2)
-
-        st.session_state['daily_df'] = daily_df
-
-with tab4:
-    st.subheader("Performance Metrics")
-
-    if 'daily_df' not in st.session_state:
-        st.info("Run the backtest in the previous tab first.")
-    else:
-        daily_df = st.session_state['daily_df']
-
-        def max_drawdown(cumulative_returns: pd.Series):
-            running_max = cumulative_returns.cummax()
-            drawdown = cumulative_returns / running_max - 1
-            return float(drawdown.min())
-
-        def cagr_log(daily_log_returns: pd.Series, trading_days=252):
-            if len(daily_log_returns) == 0:
-                return np.nan
-            total_log_return = daily_log_returns.sum()
-            total_years = len(daily_log_returns) / trading_days
-            return np.exp(total_log_return / max(total_years, 1e-12)) - 1
-
-        def annualized_volatility(daily_log_returns: pd.Series, trading_days=252):
-            return float(daily_log_returns.std() * np.sqrt(trading_days))
-
-        def sharpe_ratio_log(daily_log_returns: pd.Series, rf_annual: float, trading_days=252):
-            rf_daily = rf_annual / trading_days
-            excess_returns = daily_log_returns - rf_daily
-            return float(np.sqrt(trading_days) * excess_returns.mean() / (excess_returns.std() + 1e-12))
-
-        metrics = {}
-        for name in daily_df.columns:
-            series = daily_df[name].dropna()
-            cum_ret = np.exp(series.cumsum())
-            metrics[name] = {
-                "Max Drawdown": max_drawdown(cum_ret),
-                "CAGR": cagr_log(series, trading_days=252),
-                "Volatility": annualized_volatility(series, trading_days=252),
-                "Sharpe Ratio": sharpe_ratio_log(series, rf_annual=rf_annual, trading_days=252),
-            }
-        metrics_df = pd.DataFrame(metrics).T
-        st.dataframe(metrics_df.style.format({
-            "Max Drawdown": "{:.2%}",
-            "CAGR": "{:.2%}",
-            "Volatility": "{:.2%}",
-            "Sharpe Ratio": "{:.2f}",
-        }))
-
-        st.download_button(
-            "Download Metrics CSV",
-            data=metrics_df.to_csv().encode('utf-8'),
-            file_name="metrics.csv",
-            mime="text/csv",
-        )
-
-with tab5:
-    st.subheader("Rolling Volatility & Sharpe")
-    if 'daily_df' not in st.session_state:
-        st.info("Run the backtest in the previous tabs first.")
-    else:
-        daily_df = st.session_state['daily_df']
-        window = rolling_window_days
-
-        # Rolling Volatility
-        fig3, ax3 = plt.subplots(figsize=(12, 5))
-        for name in daily_df.columns:
-            rolling_vol = daily_df[name].rolling(window).std() * np.sqrt(252)
-            ax3.plot(rolling_vol.index, rolling_vol, label=name)
-        ax3.set_title(f'Rolling {window}-Day Annualized Volatility')
-        ax3.set_xlabel('Date')
-        ax3.set_ylabel('Volatility')
-        ax3.grid(True, linestyle='--', alpha=0.5)
-        ax3.legend()
-        st.pyplot(fig3)
-
-        # Rolling Sharpe (simple rolling mean/std)
-        fig4, ax4 = plt.subplots(figsize=(12, 5))
-        for name in daily_df.columns:
-            rolling_mean = daily_df[name].rolling(window).mean()
-            rolling_std = daily_df[name].rolling(window).std()
-            rolling_sharpe = (rolling_mean / (rolling_std + 1e-12)) * np.sqrt(252)
-            ax4.plot(rolling_sharpe.index, rolling_sharpe, label=name)
-        ax4.set_title(f'Rolling {window}-Day Sharpe Ratio')
-        ax4.set_xlabel('Date')
-        ax4.set_ylabel('Sharpe Ratio')
-        ax4.grid(True, linestyle='--', alpha=0.5)
-        ax4.legend()
-        st.pyplot(fig4)
-
-with tab6:
-    st.subheader("Correlation Heatmap (Daily Log Returns)")
-    if 'daily_df' not in st.session_state:
-        st.info("Run the backtest first to populate daily returns.")
-    else:
-        daily_df = st.session_state['daily_df']
-        corr_matrix = daily_df.corr()
-        fig5, ax5 = plt.subplots(figsize=(6, 5))
-        sns.heatmap(corr_matrix, annot=True, cmap='coolwarm', ax=ax5, fmt='.2f')
-        ax5.set_title("Portfolio Daily Returns Correlation")
-        st.pyplot(fig5)
-        st.dataframe(corr_matrix.style.format("{:.2f}"))
-
-with tab7:
-    st.subheader("Value at Risk (VaR) & Conditional VaR (CVaR)")
-    if 'daily_df' not in st.session_state:
-        st.info("Run the backtest first to compute VaR/CVaR.")
-    else:
-        daily_df = st.session_state['daily_df']
-        # 1% VaR and CVaR (on log returns)
-        var_1 = daily_df.quantile(0.01)
-        cvar_1 = daily_df[daily_df.le(var_1, axis=1)].mean()
-
-        left, right = st.columns(2)
-        with left:
-            st.write("**1% Daily VaR (log returns)**")
-            st.dataframe(var_1.to_frame("VaR 1%"))
-        with right:
-            st.write("**1% Daily CVaR (Expected Shortfall)**")
-            st.dataframe(cvar_1.to_frame("CVaR 1%"))
-
-        # Plot VaR vs. CVaR
-        x = np.arange(len(daily_df.columns))
-        fig6, ax6 = plt.subplots(figsize=(8, 5))
-        ax6.bar(x, -cvar_1.values, alpha=0.6, label='1% Daily CVaR')
-        ax6.plot(x, -var_1.values, marker='o', linewidth=2, label='1% Daily VaR')
-        ax6.set_xticks(x)
-        ax6.set_xticklabels(daily_df.columns)
-        ax6.set_ylabel('Loss (log return)')
-        ax6.set_title('1% Daily VaR vs CVaR for Portfolios')
-        ax6.grid(True, axis='y', linestyle='--', alpha=0.5)
-        ax6.legend()
-        st.pyplot(fig6)
