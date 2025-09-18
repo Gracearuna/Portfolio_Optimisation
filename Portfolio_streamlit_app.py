@@ -109,13 +109,11 @@ def predict_returns(returns: pd.DataFrame, n_lags: int) -> np.ndarray:
         predicted_returns.append(pred)
     return np.array(predicted_returns)
 
-
 def _nearest_psd(A, eps=1e-10):
     B = 0.5 * (A + A.T)
     w, V = np.linalg.eigh(B)
     w_clipped = np.clip(w, eps, None)
     return (V * w_clipped) @ V.T
-
 
 def optimize_portfolio(mu, Sigma, rf, max_variance=0.0002):
     n = len(mu)
@@ -151,17 +149,14 @@ def optimize_portfolio(mu, Sigma, rf, max_variance=0.0002):
 
     return weights_mvo, weights_sharpe
 
-
 def equal_weight_portfolio(n):
     return np.repeat(1/n, n)
-
 
 def market_implied_delta(returns, rf, market_weights):
     mu_mkt = returns.mean().values @ market_weights
     var_mkt = market_weights.T @ returns.cov().values @ market_weights
     delta = (mu_mkt - rf) / max(var_mkt, 1e-12)
     return float(max(delta, 0.0))
-
 
 def black_litterman(mu_view, Sigma, rf, tickers, returns, tau=0.2, omega_scalar=0.1):
     n = len(mu_view)
@@ -201,7 +196,6 @@ def black_litterman(mu_view, Sigma, rf, tickers, returns, tau=0.2, omega_scalar=
 
     return post_mean, w_bl
 
-
 # Performance utilities
 
 def get_portfolio_perf(weights, mu, Sigma, rf):
@@ -209,7 +203,6 @@ def get_portfolio_perf(weights, mu, Sigma, rf):
     port_vol = float(np.sqrt(np.dot(weights.T, np.dot(Sigma, weights))))
     sharpe = (port_return - rf) / (port_vol + 1e-12)
     return port_return, port_vol, sharpe
-
 
 def min_variance(Sigma):
     n = Sigma.shape[0]
@@ -221,7 +214,6 @@ def min_variance(Sigma):
                       bounds=bounds,
                       constraints=constraints)
     return result.x
-
 
 def efficient_frontier_curve(mu, Sigma, points=100):
     n = len(mu)
@@ -241,7 +233,6 @@ def efficient_frontier_curve(mu, Sigma, points=100):
         frontier_vols.append(result.fun if result.success else np.nan)
     return target_returns, np.array(frontier_vols)
 
-
 # --------------------------------
 # Data Pipeline
 # --------------------------------
@@ -255,15 +246,27 @@ if prices.empty:
     st.stop()
 
 returns = resample_returns(prices, frequency)
+if returns.empty:
+    st.error("No returns after resampling. Adjust date range, frequency or tickers.")
+    st.stop()
+
+# Align tickers to those that have data after resampling
+active_tickers = list(returns.columns)
+dropped_tickers = [tk for tk in tickers if tk not in active_tickers]
+if dropped_tickers:
+    st.warning(f"The following tickers had no data after resampling and were dropped: {', '.join(dropped_tickers)}")
+
 rf_annual = get_rf_series(start, end)
 rf = rf_annual / FREQUENCY_MAP[frequency]['rf_divisor']
 
+# compute mu/Sigma based on the available returns
 mu = predict_returns(returns, n_lags)
 Sigma = LedoitWolf().fit(returns).covariance_
 
 w_mvo, w_sharpe = optimize_portfolio(mu, Sigma, rf, max_variance)
 w_eq = equal_weight_portfolio(len(mu))
-mu_bl, w_bl = black_litterman(mu, Sigma, rf, tickers, returns, tau, omega_scalar)
+# pass active_tickers (same universe used to build mu/Sigma)
+mu_bl, w_bl = black_litterman(mu, Sigma, rf, active_tickers, returns, tau, omega_scalar)
 
 # --------------------------------
 # Tabs for Outputs
@@ -275,7 +278,7 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
 with tab1:
     st.subheader("Optimized Portfolio Weights")
     weights_df = pd.DataFrame({
-        "Ticker": tickers,
+        "Ticker": active_tickers,
         "Equal Weight": w_eq,
         "MVO": w_mvo,
         "Max Sharpe": w_sharpe,
@@ -348,19 +351,38 @@ with tab3:
         if window_returns.empty or window_returns.shape[0] <= n_lags + 2:
             current_start += rebalance_frequency
             continue
+
+        # Use tickers available in this window only
+        active_tickers_t = window_returns.columns.tolist()
+        if len(active_tickers_t) == 0:
+            current_start += rebalance_frequency
+            continue
+
         mu_t = predict_returns(window_returns, n_lags)
         Sigma_t = LedoitWolf().fit(window_returns).covariance_
-        mu_bl_t, w_bl_t = black_litterman(mu_t, Sigma_t, rf, tickers, window_returns, tau, omega_scalar)
+
+        # pass active_tickers_t into black_litterman to keep shapes consistent
+        mu_bl_t, w_bl_t = black_litterman(mu_t, Sigma_t, rf, active_tickers_t, window_returns, tau, omega_scalar)
         w_mvo_t, w_sharpe_t = optimize_portfolio(mu_t, Sigma_t, rf, max_variance)
         w_eq_t = equal_weight_portfolio(len(mu_t))
+
         out_sample_returns = returns.loc[current_lookback_end + pd.Timedelta(days=1):current_out_sample_end]
+        # If out-of-sample returns have a different ticker set, align by selecting columns present
         if out_sample_returns.empty:
             break
-        daily_mvo.extend(np.log1p(np.dot(out_sample_returns.values, w_mvo_t)))
-        daily_maxsharpe.extend(np.log1p(np.dot(out_sample_returns.values, w_sharpe_t)))
-        daily_eq.extend(np.log1p(np.dot(out_sample_returns.values, w_eq_t)))
-        daily_bl.extend(np.log1p(np.dot(out_sample_returns.values, w_bl_t)))
-        dates_list.extend(out_sample_returns.index)
+
+        # make sure out_sample_returns columns match the weights' order
+        out_sample_returns_aligned = out_sample_returns[active_tickers_t].dropna(axis=1, how='all')
+        if out_sample_returns_aligned.shape[1] != len(w_mvo_t):
+            # If shapes mismatch for any reason, skip this window
+            current_start += rebalance_frequency
+            continue
+
+        daily_mvo.extend(np.log1p(np.dot(out_sample_returns_aligned.values, w_mvo_t)))
+        daily_maxsharpe.extend(np.log1p(np.dot(out_sample_returns_aligned.values, w_sharpe_t)))
+        daily_eq.extend(np.log1p(np.dot(out_sample_returns_aligned.values, w_eq_t)))
+        daily_bl.extend(np.log1p(np.dot(out_sample_returns_aligned.values, w_bl_t)))
+        dates_list.extend(out_sample_returns_aligned.index)
         current_start += rebalance_frequency
 
     if len(dates_list) == 0:
@@ -532,4 +554,3 @@ with tab7:
         ax6.grid(True, axis='y', linestyle='--', alpha=0.5)
         ax6.legend()
         st.pyplot(fig6)
-
