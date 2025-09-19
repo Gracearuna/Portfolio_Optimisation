@@ -2,6 +2,7 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
+import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.preprocessing import StandardScaler
@@ -306,20 +307,27 @@ with tab2:
 # --- Tab 3: Cumulative Returns & Drawdowns ---
 with tab3:
     st.subheader("Cumulative Returns & Drawdowns")
+    dates = returns.index  # Use the dates as x-axis
+
+    # Cumulative Returns
     plt.figure(figsize=(12,6))
     for name, daily_ret in portfolios.items():
-        cum_ret = np.exp(pd.Series(daily_ret).cumsum())
+        cum_ret = np.exp(pd.Series(daily_ret, index=dates).cumsum())
         plt.plot(cum_ret, label=name)
     plt.title("Portfolio Cumulative Returns")
     plt.xlabel("Date")
     plt.ylabel("Cumulative Return")
     plt.legend()
     plt.grid(True)
+    plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%b %Y'))
+    plt.gca().xaxis.set_major_locator(mdates.MonthLocator(interval=3))  # Show every 3 months
+    plt.xticks(rotation=45)
     st.pyplot(plt)
 
+    # Drawdowns
     plt.figure(figsize=(12,6))
     for name, daily_ret in portfolios.items():
-        cum_ret = np.exp(pd.Series(daily_ret).cumsum())
+        cum_ret = np.exp(pd.Series(daily_ret, index=dates).cumsum())
         drawdown = cum_ret / cum_ret.cummax() - 1
         plt.plot(drawdown, label=name)
     plt.title("Portfolio Drawdowns")
@@ -327,33 +335,47 @@ with tab3:
     plt.ylabel("Drawdown")
     plt.legend()
     plt.grid(True)
+    plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%b %Y'))
+    plt.gca().xaxis.set_major_locator(mdates.MonthLocator(interval=3))
+    plt.xticks(rotation=45)
     st.pyplot(plt)
 
 # --- Tab 4: Rolling Volatility & Sharpe ---
 with tab4:
     st.subheader("Rolling Volatility & Sharpe Ratio")
     rolling_window = 21
+    dates = returns.index
+
+    # Rolling Volatility
     plt.figure(figsize=(12,6))
     for name, daily_ret in portfolios.items():
-        roll_vol = pd.Series(daily_ret).rolling(rolling_window).std()*np.sqrt(FREQUENCY_MAP[frequency]['rf_divisor'])
+        roll_vol = pd.Series(daily_ret, index=dates).rolling(rolling_window).std() * np.sqrt(FREQUENCY_MAP[frequency]['rf_divisor'])
         plt.plot(roll_vol, label=name)
     plt.title(f"Rolling {rolling_window}-day Volatility")
     plt.xlabel("Date")
     plt.ylabel("Volatility")
     plt.legend()
     plt.grid(True)
+    plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%b %Y'))
+    plt.gca().xaxis.set_major_locator(mdates.MonthLocator(interval=3))
+    plt.xticks(rotation=45)
     st.pyplot(plt)
 
+    # Rolling Sharpe
     plt.figure(figsize=(12,6))
     for name, daily_ret in portfolios.items():
-        roll_sharpe = (pd.Series(daily_ret) - rf).rolling(rolling_window).mean() / pd.Series(daily_ret).rolling(rolling_window).std() * np.sqrt(FREQUENCY_MAP[frequency]['rf_divisor'])
+        roll_sharpe = (pd.Series(daily_ret, index=dates) - rf).rolling(rolling_window).mean() / pd.Series(daily_ret, index=dates).rolling(rolling_window).std() * np.sqrt(FREQUENCY_MAP[frequency]['rf_divisor'])
         plt.plot(roll_sharpe, label=name)
     plt.title(f"Rolling {rolling_window}-day Sharpe Ratio")
     plt.xlabel("Date")
     plt.ylabel("Sharpe Ratio")
     plt.legend()
     plt.grid(True)
+    plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%b %Y'))
+    plt.gca().xaxis.set_major_locator(mdates.MonthLocator(interval=3))
+    plt.xticks(rotation=45)
     st.pyplot(plt)
+
 
 # --- Tab 5: Performance Metrics ---
 with tab5:
