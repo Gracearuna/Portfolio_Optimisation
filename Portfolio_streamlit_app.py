@@ -21,17 +21,9 @@ frequency = st.sidebar.selectbox("Return Frequency", ["daily", "weekly", "monthl
 n_lags = st.sidebar.slider("Lag Days for ML Prediction", min_value=1, max_value=5, value=2)
 
 tickers = [
-    "AAPL","MSFT","GOOGL","META","NVDA","AMD","CRM","ADBE","CSCO",
-    "JPM","BAC","GS","MS","C","AXP",
-    "JNJ","PFE","MRK","UNH","LLY","ABT",
-    "AMZN","TSLA","HD","MCD","NKE",
-    "PG","KO","PEP","WMT",
-    "XOM","CVX","COP","SLB",
-    "UNP","CAT","HON","GE",
-    "DIS","CMCSA","VZ",
-    "PLD","AMT","SPG",
-    "DOW","NEM","SHW",
-    "NEE","DUK","SO"
+   "JPM", "GS", "AAPL", "MSFT", "NVDA", "GOOGL", "META",
+    "AMZN", "HD", "KO", "XOM", "CVX", "UNH", "PFE",
+    "CAT", "UNP", "NFLX", "DIS", "NEE", "PLD"
 ]
 
 start = "2020-06-01"
