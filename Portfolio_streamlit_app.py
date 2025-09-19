@@ -1,4 +1,4 @@
-# streamlit_portfolio_dashboard_v2.py
+# streamlit_portfolio_dashboard_fixed.py
 import streamlit as st
 import yfinance as yf
 import pandas as pd
@@ -28,11 +28,12 @@ start = st.sidebar.date_input("Start Date", pd.to_datetime("2020-06-01"))
 end = st.sidebar.date_input("End Date", pd.to_datetime("2025-06-01"))
 frequency = st.sidebar.selectbox("Resampling Frequency", ['daily', 'weekly', 'monthly', 'annual'])
 n_lags = st.sidebar.slider("ML Lag Days", 1, 10, 2)
+window = st.sidebar.slider("Rolling Window Size (Days)", 5, 60, 21)
 
 st.sidebar.markdown("---")
 st.sidebar.write("Developed by: Your Name")
 
-FREQUENCY_MAP = {
+FREQ_MAP = {
     'daily': {'resample': None, 'rf_divisor': 252},
     'weekly': {'resample': 'W-FRI', 'rf_divisor': 52},
     'monthly': {'resample': 'M', 'rf_divisor': 12},
@@ -47,15 +48,18 @@ def download_data(tickers, start, end):
 
 @st.cache_data
 def get_rf_rate(start, end, freq_key):
-    treasury = web.DataReader("DGS5", "fred", start, end)
-    rf_annual = treasury.mean()[0]/100
-    return rf_annual / FREQUENCY_MAP[freq_key]['rf_divisor']
+    try:
+        treasury = web.DataReader("DGS5", "fred", start, end)
+        rf_annual = treasury.mean()[0]/100
+        return rf_annual / FREQ_MAP[freq_key]['rf_divisor']
+    except:
+        return 0.01 / FREQ_MAP[freq_key]['rf_divisor']  # fallback 1% annual
 
 stock_data = download_data(tickers, start, end)
 rf = get_rf_rate(start, end, frequency)
 
 def resample_returns(stock_data, freq_key):
-    rule = FREQUENCY_MAP[freq_key]['resample']
+    rule = FREQ_MAP[freq_key]['resample']
     if rule:
         stock_data = stock_data.resample(rule).last()
     returns = np.log(stock_data / stock_data.shift(1)).dropna()
@@ -83,10 +87,12 @@ def predict_returns(returns, n_lags):
     predicted_returns = []
     for ticker in returns.columns:
         y = np.array(y_all_dict[ticker])
-        model = RandomForestRegressor(n_estimators=50, random_state=42)
-        model.fit(X_scaled[:len(y)], y)
-        pred = model.predict(latest_input_scaled)[0]
-        predicted_returns.append(pred)
+        if len(y) < 2:  # fallback in case too few samples
+            predicted_returns.append(returns[ticker].iloc[-1])
+        else:
+            model = RandomForestRegressor(n_estimators=50, random_state=42)
+            model.fit(X_scaled[:len(y)], y)
+            predicted_returns.append(model.predict(latest_input_scaled)[0])
     return np.array(predicted_returns)
 
 mu = predict_returns(returns, n_lags)
@@ -104,8 +110,8 @@ def optimize_portfolio(mu, Sigma, rf, max_variance=0.0002):
     portfolio_variance = cp.quad_form(w_mvo, Sigma)
     constraints = [cp.sum(w_mvo)==1, w_mvo>=0, cp.max(w_mvo)<=0.3, portfolio_variance<=max_variance]
     prob = cp.Problem(cp.Maximize(portfolio_return), constraints)
-    prob.solve()
-    weights_mvo = w_mvo.value
+    prob.solve(solver=cp.SCS, verbose=False)
+    weights_mvo = np.nan_to_num(w_mvo.value)
 
     # Max Sharpe
     def neg_sharpe(w):
@@ -115,7 +121,7 @@ def optimize_portfolio(mu, Sigma, rf, max_variance=0.0002):
     bounds = [(0,0.2)]*n
     cons = [{'type':'eq','fun': lambda w: np.sum(w)-1}]
     res = minimize(neg_sharpe, np.repeat(1/n,n), method='SLSQP', bounds=bounds, constraints=cons)
-    weights_sharpe = res.x
+    weights_sharpe = np.nan_to_num(res.x)
     return weights_mvo, weights_sharpe
 
 def _nearest_psd(A, eps=1e-10):
@@ -152,7 +158,7 @@ def black_litterman(mu_view, Sigma, rf, tickers, returns, tau=0.2, omega_scalar=
     cons = [cp.sum(w)==1, w>=0]
     prob = cp.Problem(cp.Maximize(ret - delta*risk), cons)
     prob.solve(solver=cp.SCS, verbose=False)
-    return post_mean, w.value
+    return post_mean, np.nan_to_num(w.value)
 
 # --- CALCULATE PORTFOLIOS ---
 w_eq = equal_weight_portfolio(len(tickers))
@@ -161,67 +167,76 @@ mu_bl, w_bl = black_litterman(mu, Sigma, rf, tickers, returns)
 
 # --- DISPLAY PORTFOLIOS ---
 st.subheader("Portfolio Weights")
-st.dataframe(pd.DataFrame({'Ticker': tickers, 'Equal Weight': w_eq, 'MVO': w_mvo, 'Max Sharpe': w_sharpe, 'Black-Litterman': w_bl}))
+st.dataframe(pd.DataFrame({
+    'Ticker': tickers,
+    'Equal Weight': w_eq,
+    'MVO': w_mvo,
+    'Max Sharpe': w_sharpe,
+    'Black-Litterman': w_bl
+}))
 
 # === PLOTS ===
-def plot_weights(weights_dict, title):
+def plot_weights(weights_dict, tickers, title):
     fig, ax = plt.subplots(figsize=(12,6))
-    for name, w in weights_dict.items():
-        ax.bar(np.arange(len(tickers))+0.1*list(weights_dict.keys()).index(name), w, width=0.1, label=name)
-    ax.set_xticks(np.arange(len(tickers)))
+    n_assets = len(tickers)
+    n_portfolios = len(weights_dict)
+    width = 0.8 / n_portfolios
+    for i, (name, w) in enumerate(weights_dict.items()):
+        w = np.nan_to_num(w)
+        ax.bar(np.arange(n_assets)+i*width, w, width=width, label=name)
+    ax.set_xticks(np.arange(n_assets) + width*(n_portfolios-1)/2)
     ax.set_xticklabels(tickers, rotation=45)
     ax.set_ylabel("Weight")
     ax.set_title(title)
     ax.legend()
     st.pyplot(fig)
 
-plot_weights({'Equal Weight': w_eq, 'MVO': w_mvo, 'Max Sharpe': w_sharpe, 'BL': w_bl}, "Portfolio Weights Comparison")
+plot_weights({'Equal Weight': w_eq, 'MVO': w_mvo, 'Max Sharpe': w_sharpe, 'BL': w_bl}, tickers, "Portfolio Weights Comparison")
 
 # === CUMULATIVE RETURNS ===
 daily_returns = returns
 cumulative_dict = {}
 for name, w in zip(['Equal','MVO','Sharpe','BL'], [w_eq,w_mvo,w_sharpe,w_bl]):
-    cumulative_dict[name] = np.exp(np.dot(daily_returns.values, w).cumsum())
-
-fig, ax = plt.subplots(figsize=(14,8))
+    cumulative_dict[name] = np.exp(np.log1p(daily_returns.values @ w).cumsum())
+plt.figure(figsize=(12,6))
 for name, cum in cumulative_dict.items():
-    ax.plot(daily_returns.index, cum, label=name)
-ax.set_title("Cumulative Returns")
-ax.set_xlabel("Date")
-ax.set_ylabel("Cumulative Return")
-ax.legend()
-ax.grid(True)
-st.pyplot(fig)
+    plt.plot(daily_returns.index, cum, label=name)
+plt.title("Cumulative Portfolio Returns")
+plt.xlabel("Date")
+plt.ylabel("Cumulative Return")
+plt.grid(True)
+plt.legend()
+st.pyplot(plt)
 
 # === ROLLING METRICS ===
-window = 21
-st.subheader(f"Rolling {window}-Day Metrics")
-fig, ax = plt.subplots(figsize=(14,6))
+plt.figure(figsize=(12,6))
 for name, w in zip(['Equal','MVO','Sharpe','BL'], [w_eq,w_mvo,w_sharpe,w_bl]):
-    rolling_vol = pd.Series(np.dot(daily_returns.values, w), index=daily_returns.index).rolling(window).std()*np.sqrt(252)
-    ax.plot(rolling_vol, label=f"{name} Volatility")
-ax.set_title("Rolling Volatility")
-ax.set_ylabel("Volatility")
-ax.set_xlabel("Date")
-ax.legend()
-ax.grid(True)
-st.pyplot(fig)
+    rolling_vol = (np.log1p(daily_returns.values @ w).rolling(window).std()) * np.sqrt(FREQ_MAP[frequency]['rf_divisor'])
+    plt.plot(daily_returns.index, rolling_vol, label=name)
+plt.title(f"Rolling {window}-Period Volatility")
+plt.xlabel("Date")
+plt.ylabel("Volatility")
+plt.legend()
+plt.grid(True)
+st.pyplot(plt)
 
-fig, ax = plt.subplots(figsize=(14,6))
+plt.figure(figsize=(12,6))
 for name, w in zip(['Equal','MVO','Sharpe','BL'], [w_eq,w_mvo,w_sharpe,w_bl]):
-    rolling_sharpe = pd.Series(np.dot(daily_returns.values, w), index=daily_returns.index).rolling(window).mean() / \
-                     pd.Series(np.dot(daily_returns.values, w), index=daily_returns.index).rolling(window).std() * np.sqrt(252)
-    ax.plot(rolling_sharpe, label=f"{name} Sharpe")
-ax.set_title("Rolling Sharpe Ratio")
-ax.set_ylabel("Sharpe Ratio")
-ax.set_xlabel("Date")
-ax.legend()
-ax.grid(True)
-st.pyplot(fig)
+    rolling_sharpe = (np.log1p(daily_returns.values @ w).rolling(window).mean()) / \
+                     (np.log1p(daily_returns.values @ w).rolling(window).std()) * np.sqrt(FREQ_MAP[frequency]['rf_divisor'])
+    plt.plot(daily_returns.index, rolling_sharpe, label=name)
+plt.title(f"Rolling {window}-Period Sharpe Ratio")
+plt.xlabel("Date")
+plt.ylabel("Sharpe Ratio")
+plt.legend()
+plt.grid(True)
+st.pyplot(plt)
 
-# === PORTFOLIO CORRELATIONS ===
-st.subheader("Portfolio Return Correlations")
-portfolio_df = pd.DataFrame({name: np.dot(daily_returns.values, w) for name, w in zip(['Equal','MVO','Sharpe','BL'], [w_eq,w_mvo,w_sharpe,w_bl])}, index=daily_returns.index)
-fig, ax = plt.subplots(figsize=(8,6))
-sns.heatmap(portfolio_df.corr(), annot=True, cmap="coolwarm", ax=ax)
-st.pyplot(fig)
+# === PORTFOLIO CORRELATION ===
+daily_portfolio_returns = pd.DataFrame({name: np.log1p(daily_returns.values @ w) for name, w in zip(['Equal','MVO','Sharpe','BL'], [w_eq,w_mvo,w_sharpe,w_bl])}, index=daily_returns.index)
+st.subheader("Portfolio Daily Returns Correlation")
+st.dataframe(daily_portfolio_returns.corr())
+plt.figure(figsize=(8,6))
+sns.heatmap(daily_portfolio_returns.corr(), annot=True, cmap='coolwarm')
+plt.title("Portfolio Daily Returns Correlation")
+st.pyplot(plt)
