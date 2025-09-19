@@ -3,7 +3,6 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-import seaborn as sns
 from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.covariance import LedoitWolf
@@ -26,7 +25,6 @@ tickers = [
     "CAT", "UNP", "NFLX", "DIS", "NEE", "PLD"
 ]
 
-# === FREQUENCY MAP ===
 FREQUENCY_MAP = {
     'daily': {'resample': None, 'rf_divisor': 252},
     'weekly': {'resample': 'W-FRI', 'rf_divisor': 52},
@@ -36,7 +34,7 @@ FREQUENCY_MAP = {
 start = "2020-06-01"
 end = "2025-06-01"
 
-# === DOWNLOAD DATA ===
+# === DATA DOWNLOAD ===
 @st.cache_data
 def load_data(tickers, start, end):
     data = yf.download(tickers, start=start, end=end, auto_adjust=True)["Close"]
@@ -53,16 +51,6 @@ def resample_returns(stock_data, freq_key):
     return returns
 
 returns = resample_returns(stock_data, frequency)
-st.subheader("Returns Head")
-st.dataframe(returns.head())
-
-# === RISK-RETURN SUMMARY ===
-risk_return_summary = pd.DataFrame({
-    'Mean Return': returns.mean(),
-    'Volatility': returns.std()
-}).sort_values(by='Mean Return', ascending=False)
-st.subheader("Risk-Return Summary")
-st.dataframe(risk_return_summary)
 
 # === ML RETURN PREDICTION ===
 def predict_returns(returns, n_lags):
@@ -94,14 +82,12 @@ treasury = web.DataReader("DGS5", "fred", start, end)
 rf_annual = treasury["DGS5"].mean() / 100
 rf = rf_annual / FREQUENCY_MAP[frequency]['rf_divisor']
 
-# === ADAPTIVE MVO FUNCTION ===
+# === PORTFOLIO FUNCTIONS ===
 def optimize_portfolio(mu, Sigma, rf, max_variance=None):
     n = len(mu)
     if max_variance is None:
         scale_factor = np.trace(Sigma)/n
         max_variance = scale_factor * 2
-
-    # MVO
     w_mvo = cp.Variable(n)
     portfolio_return = mu @ w_mvo
     portfolio_variance = cp.quad_form(w_mvo, Sigma)
@@ -109,8 +95,6 @@ def optimize_portfolio(mu, Sigma, rf, max_variance=None):
     prob = cp.Problem(cp.Maximize(portfolio_return), constraints)
     prob.solve(solver=cp.SCS, verbose=False)
     weights_mvo = np.nan_to_num(w_mvo.value)
-
-    # Max Sharpe
     def neg_sharpe(w):
         ret = np.dot(w, mu)
         vol = np.sqrt(np.dot(w.T, np.dot(Sigma, w)))
@@ -119,19 +103,13 @@ def optimize_portfolio(mu, Sigma, rf, max_variance=None):
     cons = [{'type':'eq','fun': lambda w: np.sum(w)-1}]
     res = minimize(neg_sharpe, np.repeat(1/n,n), method='SLSQP', bounds=bounds, constraints=cons)
     weights_sharpe = np.nan_to_num(res.x)
-
     return weights_mvo, weights_sharpe
 
-# === EQUAL WEIGHT PORTFOLIO ===
 def equal_weight_portfolio(mu, Sigma, rf):
     n = len(mu)
     w_eq = np.repeat(1/n, n)
     return w_eq
 
-w_eq = equal_weight_portfolio(mu, Sigma, rf)
-w_mvo, w_sharpe = optimize_portfolio(mu, Sigma, rf)
-
-# === BLACK-LITTERMAN PORTFOLIO ===
 def _nearest_psd(A, eps=1e-10):
     B = 0.5*(A + A.T)
     w, V = np.linalg.eigh(B)
@@ -154,24 +132,17 @@ def black_litterman(mu_view, Sigma, rf, tickers, returns, tau=0.2, omega_scalar=
         except Exception:
             caps.append(0)
     caps = np.array(caps, dtype=float)
-    if np.nansum(caps) <= 0:
-        market_weights = np.full(n, 1.0/n)
-    else:
-        market_weights = caps/np.nansum(caps)
+    market_weights = caps/np.nansum(caps) if np.nansum(caps)>0 else np.full(n, 1.0/n)
     mu_view = np.asarray(mu_view, dtype=float).reshape(-1)
     Sigma = np.asarray(Sigma, dtype=float)
     Sigma_psd = _nearest_psd(Sigma)
-
     delta = market_implied_delta(returns, rf, market_weights)
     Pi = delta * (Sigma_psd @ market_weights)
-
     P = np.eye(n)
     Omega = np.eye(n) * omega_scalar
     A = np.linalg.inv(tau*Sigma_psd)
     post_prec = A + P.T @ np.linalg.inv(Omega) @ P
     post_mean = np.linalg.inv(post_prec) @ (A @ Pi + P.T @ np.linalg.inv(Omega) @ mu_view)
-
-    # MVO on posterior mean
     w = cp.Variable(n)
     ret = post_mean @ w
     risk = cp.quad_form(w, Sigma_psd)
@@ -181,113 +152,81 @@ def black_litterman(mu_view, Sigma, rf, tickers, returns, tau=0.2, omega_scalar=
     weights_bl = np.nan_to_num(w.value)
     return post_mean, weights_bl
 
+# === CALCULATE PORTFOLIOS ===
+w_eq = equal_weight_portfolio(mu, Sigma, rf)
+w_mvo, w_sharpe = optimize_portfolio(mu, Sigma, rf)
 mu_bl, w_bl = black_litterman(mu, Sigma, rf, tickers, returns)
 
-# === PORTFOLIO WEIGHTS PLOT ===
-def plot_weights(weights_dict, tickers, title):
-    n_assets = len(tickers)
-    width = 0.15
-    fig, ax = plt.subplots(figsize=(12,6))
-    for i, (name, w) in enumerate(weights_dict.items()):
-        w = np.nan_to_num(w)
-        ax.bar(np.arange(n_assets)+i*width, w, width=width, label=name)
-    ax.set_xticks(np.arange(n_assets)+width*(len(weights_dict)-1)/2)
-    ax.set_xticklabels(tickers, rotation=45)
-    ax.set_ylabel("Weights")
-    ax.set_title(title)
-    ax.legend()
-    ax.grid(True)
-    st.pyplot(fig)
-
-plot_weights({
+portfolios = {
     "Equal": w_eq,
     "MVO": w_mvo,
     "Max Sharpe": w_sharpe,
     "BL": w_bl
-}, tickers, "Portfolio Weights Comparison")
-
-# === SAFE PORTFOLIO RETURN ===
-def safe_portfolio_return(returns, weights):
-    weights = np.nan_to_num(weights).flatten()
-    return returns.values @ weights
-
-portfolios = {
-    "Equal": safe_portfolio_return(returns, w_eq),
-    "MVO": safe_portfolio_return(returns, w_mvo),
-    "Max Sharpe": safe_portfolio_return(returns, w_sharpe),
-    "BL": safe_portfolio_return(returns, w_bl)
 }
 
-# === METRICS ===
-def max_drawdown(cum_ret):
-    return (cum_ret / cum_ret.cummax() - 1).min()
-def cagr_log(daily_log_returns, trading_days=252):
-    total_log_return = daily_log_returns.sum()
-    total_years = len(daily_log_returns)/trading_days
-    return np.exp(total_log_return/total_years)-1
-def annualized_volatility(daily_log_returns, trading_days=252):
-    return daily_log_returns.std()*np.sqrt(trading_days)
+# === SINGLE-PORTFOLIO ANALYSIS ===
+st.subheader("Single Portfolio Analysis")
+single_option = st.selectbox("Select Portfolio", ["Equal", "MVO", "Max Sharpe", "BL"])
+weights_single = portfolios[single_option]
+
+# Weights plot
+fig, ax = plt.subplots(figsize=(12,6))
+ax.bar(tickers, np.nan_to_num(weights_single))
+ax.set_ylabel("Weights")
+ax.set_title(f"{single_option} Portfolio Weights")
+ax.set_xticklabels(tickers, rotation=45)
+ax.grid(True)
+st.pyplot(fig)
+
+# Cumulative returns + drawdown
+daily_log = pd.Series(returns.values @ np.nan_to_num(weights_single), index=returns.index)
+cum_ret = np.exp(daily_log.cumsum())
+running_max = cum_ret.cummax()
+drawdown = cum_ret / running_max - 1
+
+fig2, ax2 = plt.subplots(figsize=(12,6))
+ax2.plot(cum_ret, label=f"{single_option} Cumulative Return", color="blue")
+ax2.fill_between(drawdown.index, cum_ret, running_max, where=drawdown<0, color='red', alpha=0.2, label="Drawdown")
+ax2.set_title(f"{single_option} Portfolio Cumulative Return and Drawdown")
+ax2.set_xlabel("Date")
+ax2.set_ylabel("Cumulative Return")
+ax2.grid(True)
+ax2.legend()
+st.pyplot(fig2)
+
+# Portfolio metrics
+def max_drawdown(cum_ret): return (cum_ret/cum_ret.cummax()-1).min()
+def cagr_log(daily_log_returns, trading_days=252): return np.exp(daily_log_returns.sum()/ (len(daily_log_returns)/trading_days))-1
+def annualized_volatility(daily_log_returns, trading_days=252): return daily_log_returns.std()*np.sqrt(trading_days)
 def sharpe_ratio_log(daily_log_returns, rf_annual=rf_annual, trading_days=252):
     rf_daily = rf_annual/trading_days
-    excess = daily_log_returns - rf_daily
+    excess = daily_log_returns-rf_daily
     return np.sqrt(trading_days)*excess.mean()/excess.std()
 
-metrics = {}
-for name, daily_ret in portfolios.items():
-    cum_ret = np.exp(pd.Series(daily_ret).cumsum())
-    metrics[name] = {
-        "Max Drawdown": max_drawdown(cum_ret),
-        "CAGR": cagr_log(pd.Series(daily_ret)),
-        "Volatility": annualized_volatility(pd.Series(daily_ret)),
-        "Sharpe Ratio": sharpe_ratio_log(pd.Series(daily_ret))
-    }
+metrics = {
+    "Max Drawdown": max_drawdown(cum_ret),
+    "CAGR": cagr_log(daily_log),
+    "Volatility": annualized_volatility(daily_log),
+    "Sharpe Ratio": sharpe_ratio_log(daily_log)
+}
+st.subheader(f"{single_option} Portfolio Metrics")
+st.dataframe(pd.DataFrame(metrics, index=[0]).T)
 
-st.subheader("Portfolio Metrics")
-st.dataframe(pd.DataFrame(metrics).T)
-
-# === CUMULATIVE RETURNS ===
-plt.figure(figsize=(12,6))
-for name, daily_ret in portfolios.items():
-    cum_ret = np.exp(pd.Series(daily_ret).cumsum())
-    plt.plot(cum_ret, label=name)
-plt.title("Portfolio Cumulative Returns")
-plt.xlabel("Date")
-plt.ylabel("Cumulative Return")
-plt.legend()
-plt.grid(True)
-st.pyplot(plt)
-
-# === CORRELATION MATRIX ===
-daily_df = pd.DataFrame({name: portfolios[name] for name in portfolios})
-st.subheader("Portfolio Daily Returns Correlation")
-st.dataframe(daily_df.corr())
-
-# === EFFICIENT FRONTIER ===
-def efficient_frontier(mu, Sigma, rf, n_points=50):
-    n = len(mu)
-    w_list, rets, vols, sharpes = [], [], [], []
-    for target_ret in np.linspace(mu.min(), mu.max(), n_points):
-        w = cp.Variable(n)
-        ret = mu @ w
-        risk = cp.quad_form(w, Sigma)
-        constraints = [cp.sum(w)==1, w>=0, ret==target_ret]
-        prob = cp.Problem(cp.Minimize(risk), constraints)
-        prob.solve(solver=cp.SCS, verbose=False)
-        if w.value is not None:
-            w_list.append(np.nan_to_num(w.value))
-            rets.append(target_ret)
-            vol = np.sqrt(risk.value)
-            vols.append(vol)
-            sharpes.append((target_ret-rf)/vol)
-    return rets, vols, sharpes
-
-rets_ef, vols_ef, sharpes_ef = efficient_frontier(mu, Sigma, rf)
-plt.figure(figsize=(12,6))
-plt.plot(vols_ef, rets_ef, 'g--', label="Efficient Frontier")
-plt.scatter(np.sqrt(np.diag(Sigma)), mu, c='red', label='Individual Stocks')
-plt.xlabel("Volatility")
-plt.ylabel("Expected Return")
-plt.title("Efficient Frontier")
-plt.legend()
-plt.grid(True)
-st.pyplot(plt)
+# === MULTI-PORTFOLIO COMPARISON ===
+st.subheader("Multi-Portfolio Comparison")
+multi_option = st.multiselect("Select Portfolios to Compare", ["Equal", "MVO", "Max Sharpe", "BL"], default=["Equal","MVO","Max Sharpe","BL"])
+fig3, ax3 = plt.subplots(figsize=(14,7))
+for name in multi_option:
+    w = portfolios[name]
+    daily_log = pd.Series(returns.values @ np.nan_to_num(w), index=returns.index)
+    cum_ret = np.exp(daily_log.cumsum())
+    running_max = cum_ret.cummax()
+    drawdown = cum_ret/running_max -1
+    ax3.plot(cum_ret, label=f"{name} Cumulative Return")
+    ax3.fill_between(drawdown.index, cum_ret, running_max, where=drawdown<0, alpha=0.2)
+ax3.set_title("Comparison of Selected Portfolio Cumulative Returns and Drawdowns")
+ax3.set_xlabel("Date")
+ax3.set_ylabel("Cumulative Return")
+ax3.grid(True)
+ax3.legend()
+st.pyplot(fig3)
