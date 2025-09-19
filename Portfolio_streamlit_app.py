@@ -2,258 +2,292 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
-from sklearn.ensemble import RandomForestRegressor
+import matplotlib.pyplot as plt
+import seaborn as sns
 from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import RandomForestRegressor
 from sklearn.covariance import LedoitWolf
 import cvxpy as cp
 from scipy.optimize import minimize
-import matplotlib.pyplot as plt
-import seaborn as sns
 import pandas_datareader.data as web
-from datetime import date
+import warnings
+warnings.filterwarnings("ignore")
 
-st.set_page_config(page_title="Portfolio Optimization Dashboard", layout="wide")
+st.set_page_config(layout="wide", page_title="Portfolio Optimization Dashboard")
 
-# ---------------------------
-# Sidebar Controls
-# ---------------------------
-st.sidebar.header("Portfolio Settings")
-DEFAULT_TICKERS = [
+# === SIDEBAR OPTIONS ===
+frequency = st.sidebar.selectbox("Select Return Frequency", ['daily', 'weekly', 'monthly'])
+n_lags = st.sidebar.slider("ML Lag Period", 1, 5, 2)
+
+# Selected 20 tickers
+tickers = [
     "JPM", "GS", "AAPL", "MSFT", "NVDA", "GOOGL", "META",
     "AMZN", "HD", "KO", "XOM", "CVX", "UNH", "PFE",
     "CAT", "UNP", "NFLX", "DIS", "NEE", "PLD"
 ]
 
-tickers = st.sidebar.multiselect("Select Tickers", DEFAULT_TICKERS, default=DEFAULT_TICKERS[:10])
-start = st.sidebar.date_input("Start Date", pd.to_datetime("2020-06-01").date())
-end = st.sidebar.date_input("End Date", pd.to_datetime("2025-06-01").date())
-frequency = st.sidebar.selectbox("Frequency", ["daily", "weekly", "monthly"])
-n_lags = st.sidebar.slider("ML Lag Period", 1, 5, 2)
-max_variance = st.sidebar.number_input("Max Variance (MVO)", 0.0001, 0.01, 0.0002, format="%.6f")
-tau = st.sidebar.number_input("BL τ", 0.01, 1.0, 0.2, format="%.4f")
-omega_scalar = st.sidebar.number_input("BL Ω Scalar", 0.01, 1.0, 0.1, format="%.4f")
-rolling_window_days = st.sidebar.slider("Rolling Window (days)", 10, 126, 21)
+# === FREQUENCY MAP ===
+FREQUENCY_MAP = {
+    'daily': {'resample': None, 'rf_divisor': 252},
+    'weekly': {'resample': 'W-FRI', 'rf_divisor': 52},
+    'monthly': {'resample': 'M', 'rf_divisor': 12}
+}
 
-# ---------------------------
-# Helper Functions
-# ---------------------------
+start = "2020-06-01"
+end = "2025-06-01"
+
+# === DOWNLOAD DATA ===
 @st.cache_data
-def download_prices(tickers, start, end):
-    if not tickers: return pd.DataFrame()
-    df = yf.download(tickers, start=start, end=end, auto_adjust=True)["Close"]
-    if isinstance(df, pd.Series): df = df.to_frame()
-    return df.dropna(how="all")
+def load_data(tickers, start, end):
+    data = yf.download(tickers, start=start, end=end, auto_adjust=True)["Close"]
+    return data
 
-def resample_returns(df, freq):
-    freq_map = {'daily': None, 'weekly': 'W-FRI', 'monthly': 'M'}
-    rule = freq_map.get(freq)
-    if rule: df = df.resample(rule).last()
-    returns = np.log(df / df.shift(1)).dropna()
+stock_data = load_data(tickers, start, end)
+
+# === RESAMPLE RETURNS ===
+def resample_returns(stock_data, freq_key):
+    rule = FREQUENCY_MAP[freq_key]['resample']
+    if rule:
+        stock_data = stock_data.resample(rule).last()
+    returns = np.log(stock_data / stock_data.shift(1)).dropna()
     return returns
 
-def get_rf(start, end):
-    try:
-        rf_series = web.DataReader("DGS5", "fred", start, end)
-        rf_annual = float(rf_series["DGS5"].mean()) / 100
-    except:
-        rf_annual = 0.02
-    return rf_annual
+returns = resample_returns(stock_data, frequency)
+st.subheader("Returns Head")
+st.dataframe(returns.head())
 
-def predict_mu(returns, n_lags):
-    if returns.shape[0] <= n_lags + 2: return returns.mean().values
-    X, y_dict = [], {t: [] for t in returns.columns}
+# === RISK-RETURN SUMMARY ===
+risk_return_summary = pd.DataFrame({
+    'Mean Return': returns.mean(),
+    'Volatility': returns.std()
+}).sort_values(by='Mean Return', ascending=False)
+st.subheader("Risk-Return Summary")
+st.dataframe(risk_return_summary)
+
+# === ML RETURN PREDICTION ===
+def predict_returns(returns, n_lags):
+    X_all, y_all_dict = [], {ticker: [] for ticker in returns.columns}
     for i in range(n_lags, len(returns)-1):
-        lag = returns.iloc[i-n_lags:i].values.flatten()
-        X.append(lag)
-        for t in returns.columns: y_dict[t].append(returns.iloc[i+1][t])
-    X = np.array(X); scaler = StandardScaler(); X_scaled = scaler.fit_transform(X)
-    latest = scaler.transform(returns.iloc[-n_lags:].values.flatten().reshape(1,-1))
-    mu_pred = []
-    for t in returns.columns:
-        y = np.array(y_dict[t])
+        lagged = returns.iloc[i-n_lags:i].values.flatten()
+        X_all.append(lagged)
+        for ticker in returns.columns:
+            y_all_dict[ticker].append(returns.iloc[i+1][ticker])
+    X = np.array(X_all)
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+    latest_input = returns.iloc[-n_lags:].values.flatten().reshape(1,-1)
+    latest_input_scaled = scaler.transform(latest_input)
+    predicted_returns = []
+    for ticker in returns.columns:
+        y = np.array(y_all_dict[ticker])
         model = RandomForestRegressor(n_estimators=50, random_state=42)
         model.fit(X_scaled[:len(y)], y)
-        mu_pred.append(model.predict(latest)[0])
-    return np.array(mu_pred)
+        pred = model.predict(latest_input_scaled)[0]
+        predicted_returns.append(pred)
+    return np.array(predicted_returns)
 
+mu = predict_returns(returns, n_lags)
+Sigma = LedoitWolf().fit(returns).covariance_
+
+# === RISK-FREE RATE ===
+treasury = web.DataReader("DGS5", "fred", start, end)
+rf_annual = treasury["DGS5"].mean() / 100
+rf = rf_annual / FREQUENCY_MAP[frequency]['rf_divisor']
+
+# === ADAPTIVE MVO FUNCTION ===
+def optimize_portfolio(mu, Sigma, rf, max_variance=None):
+    n = len(mu)
+    if max_variance is None:
+        scale_factor = np.trace(Sigma)/n
+        max_variance = scale_factor * 2
+
+    # MVO
+    w_mvo = cp.Variable(n)
+    portfolio_return = mu @ w_mvo
+    portfolio_variance = cp.quad_form(w_mvo, Sigma)
+    constraints = [cp.sum(w_mvo)==1, w_mvo>=0, cp.max(w_mvo)<=0.3, portfolio_variance<=max_variance]
+    prob = cp.Problem(cp.Maximize(portfolio_return), constraints)
+    prob.solve(solver=cp.SCS, verbose=False)
+    weights_mvo = np.nan_to_num(w_mvo.value)
+
+    # Max Sharpe
+    def neg_sharpe(w):
+        ret = np.dot(w, mu)
+        vol = np.sqrt(np.dot(w.T, np.dot(Sigma, w)))
+        return -(ret - rf)/vol
+    bounds = [(0,0.2)]*n
+    cons = [{'type':'eq','fun': lambda w: np.sum(w)-1}]
+    res = minimize(neg_sharpe, np.repeat(1/n,n), method='SLSQP', bounds=bounds, constraints=cons)
+    weights_sharpe = np.nan_to_num(res.x)
+
+    return weights_mvo, weights_sharpe
+
+# === EQUAL WEIGHT PORTFOLIO ===
+def equal_weight_portfolio(mu, Sigma, rf):
+    n = len(mu)
+    w_eq = np.repeat(1/n, n)
+    return w_eq
+
+w_eq = equal_weight_portfolio(mu, Sigma, rf)
+w_mvo, w_sharpe = optimize_portfolio(mu, Sigma, rf)
+
+# === BLACK-LITTERMAN PORTFOLIO ===
 def _nearest_psd(A, eps=1e-10):
     B = 0.5*(A + A.T)
     w, V = np.linalg.eigh(B)
-    return (V * np.clip(w, eps, None)) @ V.T
+    w_clipped = np.clip(w, eps, None)
+    return (V * w_clipped) @ V.T
 
-def optimize_portfolio(mu, Sigma, rf, max_var):
-    n = len(mu); Sigma = _nearest_psd(Sigma)
-    # MVO
-    w = cp.Variable(n)
-    ret = mu @ w; risk = cp.quad_form(w, Sigma)
-    constraints = [cp.sum(w)==1, w>=0, risk<=max_var]
-    cp.Problem(cp.Maximize(ret), constraints).solve(solver=cp.SCS, verbose=False)
-    w_mvo = np.nan_to_num(w.value)
-    # Max Sharpe
-    def neg_sharpe(w): return -((w@mu - rf)/np.sqrt(w.T @ Sigma @ w + 1e-12))
-    res = minimize(neg_sharpe, np.repeat(1/n, n), method='SLSQP', bounds=[(0,0.2)]*n,
-                   constraints={'type':'eq','fun':lambda w: np.sum(w)-1})
-    w_sharpe = np.nan_to_num(res.x)
-    return w_mvo, w_sharpe
+def market_implied_delta(returns, rf, market_weights):
+    mu_mkt = returns.mean().values @ market_weights
+    var_mkt = market_weights.T @ returns.cov().values @ market_weights
+    delta = (mu_mkt - rf)/max(var_mkt, 1e-12)
+    return float(max(delta, 0.0))
 
-def equal_weights(n): return np.repeat(1/n, n)
-
-def black_litterman(mu_view, Sigma, rf, tickers, returns, tau, omega):
-    n = len(mu_view); Sigma = _nearest_psd(Sigma)
+def black_litterman(mu_view, Sigma, rf, tickers, returns, tau=0.2, omega_scalar=0.1):
+    n = len(mu_view)
     caps = []
     for tk in tickers:
-        try: caps.append(yf.Ticker(tk).info.get("marketCap",0))
-        except: caps.append(0)
-    caps = np.array(caps); w_mkt = caps/np.nansum(caps) if np.nansum(caps)>0 else np.repeat(1/n,n)
-    delta = max((returns.mean().values @ w_mkt - rf)/(w_mkt.T @ returns.cov().values @ w_mkt),0)
-    Pi = delta * Sigma @ w_mkt
-    P, Omega = np.eye(n), np.eye(n)*omega
-    post = np.linalg.inv(tau*Sigma)**1 + P.T @ np.linalg.inv(Omega) @ P
-    mu_post = np.linalg.inv(post) @ (np.linalg.inv(tau*Sigma)@Pi + P.T @ np.linalg.inv(Omega) @ mu_view)
-    w = cp.Variable(n)
-    ret, risk = mu_post@w, cp.quad_form(w,Sigma)
-    cp.Problem(cp.Maximize(ret - delta*risk), [cp.sum(w)==1,w>=0]).solve(solver=cp.SCS, verbose=False)
-    return mu_post, np.nan_to_num(w.value)
-
-def get_portfolio_perf(weights, mu, Sigma, rf):
-    ret = float(weights @ mu)
-    vol = float(np.sqrt(weights.T @ Sigma @ weights))
-    sharpe = (ret - rf)/(vol + 1e-12)
-    return ret, vol, sharpe
-
-def efficient_frontier(mu, Sigma, points=100):
-    n = len(mu)
-    frontier_vols, frontier_rets = [], np.linspace(min(mu), max(mu), points)
-    for target in frontier_rets:
-        res = minimize(lambda w: np.sqrt(w.T@Sigma@w),
-                       x0=np.repeat(1/n,n),
-                       bounds=[(0,1)]*n,
-                       constraints=[{'type':'eq','fun': lambda w: np.sum(w)-1},
-                                    {'type':'eq','fun': lambda w, t=target: np.dot(w, mu)-t}])
-        frontier_vols.append(res.fun if res.success else np.nan)
-    return frontier_rets, np.array(frontier_vols)
-
-# ---------------------------
-# Data Pipeline
-# ---------------------------
-if not tickers: st.warning("Select at least one ticker."); st.stop()
-prices = download_prices(tickers, start, end)
-if prices.empty: st.error("No price data returned."); st.stop()
-returns = resample_returns(prices, frequency)
-rf_annual = get_rf(start, end)
-rf = rf_annual / {'daily':252,'weekly':52,'monthly':12}[frequency]
-
-mu = predict_mu(returns, n_lags)
-Sigma = LedoitWolf().fit(returns).covariance_
-w_mvo, w_sharpe = optimize_portfolio(mu, Sigma, rf, max_variance)
-w_eq = equal_weights(len(mu))
-mu_bl, w_bl = black_litterman(mu, Sigma, rf, tickers, returns, tau, omega_scalar)
-
-portfolios = {"Equal": w_eq, "MVO": w_mvo, "Max Sharpe": w_sharpe, "BL": w_bl}
-
-# ---------------------------
-# Tabs
-# ---------------------------
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
-    ["Weights","Efficient Frontier","Cumulative Returns & Drawdowns","Performance Metrics","Rolling Volatility & Sharpe","Correlation Heatmap"]
-)
-
-# Tab 1: Portfolio Weights
-with tab1:
-    st.subheader("Optimized Portfolio Weights")
-    df_w = pd.DataFrame({ "Ticker": tickers })
-    for name, w in portfolios.items(): df_w[name] = w
-    st.dataframe(df_w.set_index("Ticker"))
-    st.download_button("Download Weights CSV", df_w.to_csv(index=False).encode(), "weights.csv")
-
-    fig, ax = plt.subplots(figsize=(12,5))
-    for i,(name,w) in enumerate(portfolios.items()):
-        ax.bar(np.arange(len(tickers))+0.2*i, w, width=0.2, label=name)
-    ax.set_xticks(np.arange(len(tickers))); ax.set_xticklabels(tickers, rotation=45)
-    ax.set_ylabel("Weight"); ax.set_title("Portfolio Weights"); ax.legend(); ax.grid(True)
-    st.pyplot(fig)
-
-# Tab 2: Efficient Frontier
-with tab2:
-    st.subheader("Efficient Frontier & Random Portfolios")
-    n = len(mu)
+        try:
+            info = yf.Ticker(tk).info
+            caps.append(info.get("marketCap",0))
+        except Exception:
+            caps.append(0)
+    caps = np.array(caps, dtype=float)
+    if np.nansum(caps) <= 0:
+        market_weights = np.full(n, 1.0/n)
+    else:
+        market_weights = caps/np.nansum(caps)
+    mu_view = np.asarray(mu_view, dtype=float).reshape(-1)
+    Sigma = np.asarray(Sigma, dtype=float)
     Sigma_psd = _nearest_psd(Sigma)
-    num_port = 2000
-    results = np.zeros((3, num_port))
-    for i in range(num_port):
-        w = np.random.dirichlet(np.ones(n))
-        r, v, s = get_portfolio_perf(w, mu, Sigma_psd, rf)
-        results[:, i] = [r, v, s]
-    frontier_rets, frontier_vols = efficient_frontier(mu, Sigma_psd)
-    fig, ax = plt.subplots(figsize=(10,6))
-    sc = ax.scatter(results[1,:], results[0,:], c=results[2,:], cmap='viridis', alpha=0.5, label='Random Portfolios')
-    ax.plot(frontier_vols, frontier_rets, 'r--', lw=2, label='Efficient Frontier')
-    for name,w in portfolios.items():
-        r,v,s = get_portfolio_perf(w, mu, Sigma_psd, rf)
-        ax.scatter(v,r,marker='X',s=160,label=f"{name} (Sharpe: {s:.2f})")
-    ax.set_xlabel("Volatility"); ax.set_ylabel("Expected Return"); ax.set_title(f"{frequency.title()} Efficient Frontier")
-    ax.grid(True); ax.legend(); cbar=plt.colorbar(sc); cbar.set_label("Sharpe Ratio")
-    st.pyplot(fig)
 
-# Tab 3: Cumulative Returns & Drawdowns
-with tab3:
-    st.subheader("Cumulative Returns & Drawdowns")
-    daily_port = pd.DataFrame({name: returns.values @ w for name,w in portfolios.items()}, index=returns.index)
-    cumulative = np.exp(daily_port.cumsum())
+    delta = market_implied_delta(returns, rf, market_weights)
+    Pi = delta * (Sigma_psd @ market_weights)
+
+    P = np.eye(n)
+    Omega = np.eye(n) * omega_scalar
+    A = np.linalg.inv(tau*Sigma_psd)
+    post_prec = A + P.T @ np.linalg.inv(Omega) @ P
+    post_mean = np.linalg.inv(post_prec) @ (A @ Pi + P.T @ np.linalg.inv(Omega) @ mu_view)
+
+    # MVO on posterior mean
+    w = cp.Variable(n)
+    ret = post_mean @ w
+    risk = cp.quad_form(w, Sigma_psd)
+    constraints = [cp.sum(w)==1, w>=0]
+    prob = cp.Problem(cp.Maximize(ret - delta*risk), constraints)
+    prob.solve(solver=cp.SCS, verbose=False)
+    weights_bl = np.nan_to_num(w.value)
+    return post_mean, weights_bl
+
+mu_bl, w_bl = black_litterman(mu, Sigma, rf, tickers, returns)
+
+# === PORTFOLIO WEIGHTS PLOT ===
+def plot_weights(weights_dict, tickers, title):
+    n_assets = len(tickers)
+    width = 0.15
     fig, ax = plt.subplots(figsize=(12,6))
-    for col in cumulative.columns:
-        series = cumulative[col]; running_max = series.cummax(); drawdown = series/running_max-1
-        ax.plot(series.index, series, label=col)
-        ax.fill_between(series.index, series, running_max, where=drawdown<0, alpha=0.2)
-    ax.set_title("Cumulative Returns with Drawdowns"); ax.set_xlabel("Date"); ax.set_ylabel("Cumulative Return")
-    ax.grid(True); ax.legend()
-    st.pyplot(fig)
-    st.session_state['daily_port'] = daily_port
-
-# Tab 4: Performance Metrics
-with tab4:
-    st.subheader("Performance Metrics")
-    if 'daily_port' not in st.session_state: st.info("Run backtest first."); st.stop()
-    daily_df = st.session_state['daily_port']
-    metrics = {}
-    def max_dd(series): return float((series/series.cummax()-1).min())
-    def cagr_log(logrets, td=252): return float(np.exp(logrets.sum()/max(len(logrets)/td,1e-12))-1)
-    def ann_vol(logrets, td=252): return float(logrets.std()*np.sqrt(td))
-    def sharpe_log(logrets, rf, td=252): return float(np.sqrt(td)*(logrets - rf/td).mean() / (logrets.std()+1e-12))
-    for name in daily_df.columns:
-        series = daily_df[name]; cum = np.exp(series.cumsum())
-        metrics[name] = {"Max Drawdown": max_dd(cum),"CAGR": cagr_log(series),
-                         "Volatility": ann_vol(series),"Sharpe": sharpe_log(series, rf_annual)}
-    df_metrics = pd.DataFrame(metrics).T
-    st.dataframe(df_metrics.style.format({"Max Drawdown":"{:.2%}","CAGR":"{:.2%}","Volatility":"{:.2%}","Sharpe":"{:.2f}"}))
-    st.download_button("Download Metrics CSV", df_metrics.to_csv().encode(), "metrics.csv")
-
-# Tab 5: Rolling Volatility & Sharpe
-with tab5:
-    st.subheader("Rolling Volatility & Sharpe")
-    window = rolling_window_days
-    fig, ax = plt.subplots(figsize=(12,5))
-    for name in daily_df.columns:
-        ax.plot(daily_df[name].rolling(window).std()*np.sqrt(252), label=name)
-    ax.set_title(f"Rolling {window}-Day Annualized Volatility"); ax.set_xlabel("Date"); ax.set_ylabel("Volatility")
-    ax.grid(True); ax.legend()
-    st.pyplot(fig)
-    fig, ax = plt.subplots(figsize=(12,5))
-    for name in daily_df.columns:
-        rolling_mean = daily_df[name].rolling(window).mean()
-        rolling_std = daily_df[name].rolling(window).std()
-        rolling_sharpe = rolling_mean/(rolling_std+1e-12)*np.sqrt(252)
-        ax.plot(rolling_sharpe, label=name)
-    ax.set_title(f"Rolling {window}-Day Sharpe Ratio"); ax.set_xlabel("Date"); ax.set_ylabel("Sharpe")
-    ax.grid(True); ax.legend()
+    for i, (name, w) in enumerate(weights_dict.items()):
+        w = np.nan_to_num(w)
+        ax.bar(np.arange(n_assets)+i*width, w, width=width, label=name)
+    ax.set_xticks(np.arange(n_assets)+width*(len(weights_dict)-1)/2)
+    ax.set_xticklabels(tickers, rotation=45)
+    ax.set_ylabel("Weights")
+    ax.set_title(title)
+    ax.legend()
+    ax.grid(True)
     st.pyplot(fig)
 
-# Tab 6: Correlation Heatmap
-with tab6:
-    st.subheader("Correlation Heatmap (Daily Log Returns)")
-    corr = daily_df.corr()
-    fig, ax = plt.subplots(figsize=(8,6))
-    sns.heatmap(corr, annot=True, cmap="coolwarm", fmt=".2f", ax=ax)
-    ax.set_title("Portfolio Daily Returns Correlation")
-    st.pyplot(fig)
-    st.dataframe(corr.style.format("{:.2f}"))
+plot_weights({
+    "Equal": w_eq,
+    "MVO": w_mvo,
+    "Max Sharpe": w_sharpe,
+    "BL": w_bl
+}, tickers, "Portfolio Weights Comparison")
+
+# === SAFE PORTFOLIO RETURN ===
+def safe_portfolio_return(returns, weights):
+    weights = np.nan_to_num(weights).flatten()
+    return returns.values @ weights
+
+portfolios = {
+    "Equal": safe_portfolio_return(returns, w_eq),
+    "MVO": safe_portfolio_return(returns, w_mvo),
+    "Max Sharpe": safe_portfolio_return(returns, w_sharpe),
+    "BL": safe_portfolio_return(returns, w_bl)
+}
+
+# === METRICS ===
+def max_drawdown(cum_ret):
+    return (cum_ret / cum_ret.cummax() - 1).min()
+def cagr_log(daily_log_returns, trading_days=252):
+    total_log_return = daily_log_returns.sum()
+    total_years = len(daily_log_returns)/trading_days
+    return np.exp(total_log_return/total_years)-1
+def annualized_volatility(daily_log_returns, trading_days=252):
+    return daily_log_returns.std()*np.sqrt(trading_days)
+def sharpe_ratio_log(daily_log_returns, rf_annual=rf_annual, trading_days=252):
+    rf_daily = rf_annual/trading_days
+    excess = daily_log_returns - rf_daily
+    return np.sqrt(trading_days)*excess.mean()/excess.std()
+
+metrics = {}
+for name, daily_ret in portfolios.items():
+    cum_ret = np.exp(pd.Series(daily_ret).cumsum())
+    metrics[name] = {
+        "Max Drawdown": max_drawdown(cum_ret),
+        "CAGR": cagr_log(pd.Series(daily_ret)),
+        "Volatility": annualized_volatility(pd.Series(daily_ret)),
+        "Sharpe Ratio": sharpe_ratio_log(pd.Series(daily_ret))
+    }
+
+st.subheader("Portfolio Metrics")
+st.dataframe(pd.DataFrame(metrics).T)
+
+# === CUMULATIVE RETURNS ===
+plt.figure(figsize=(12,6))
+for name, daily_ret in portfolios.items():
+    cum_ret = np.exp(pd.Series(daily_ret).cumsum())
+    plt.plot(cum_ret, label=name)
+plt.title("Portfolio Cumulative Returns")
+plt.xlabel("Date")
+plt.ylabel("Cumulative Return")
+plt.legend()
+plt.grid(True)
+st.pyplot(plt)
+
+# === CORRELATION MATRIX ===
+daily_df = pd.DataFrame({name: portfolios[name] for name in portfolios})
+st.subheader("Portfolio Daily Returns Correlation")
+st.dataframe(daily_df.corr())
+
+# === EFFICIENT FRONTIER ===
+def efficient_frontier(mu, Sigma, rf, n_points=50):
+    n = len(mu)
+    w_list, rets, vols, sharpes = [], [], [], []
+    for target_ret in np.linspace(mu.min(), mu.max(), n_points):
+        w = cp.Variable(n)
+        ret = mu @ w
+        risk = cp.quad_form(w, Sigma)
+        constraints = [cp.sum(w)==1, w>=0, ret==target_ret]
+        prob = cp.Problem(cp.Minimize(risk), constraints)
+        prob.solve(solver=cp.SCS, verbose=False)
+        if w.value is not None:
+            w_list.append(np.nan_to_num(w.value))
+            rets.append(target_ret)
+            vol = np.sqrt(risk.value)
+            vols.append(vol)
+            sharpes.append((target_ret-rf)/vol)
+    return rets, vols, sharpes
+
+rets_ef, vols_ef, sharpes_ef = efficient_frontier(mu, Sigma, rf)
+plt.figure(figsize=(12,6))
+plt.plot(vols_ef, rets_ef, 'g--', label="Efficient Frontier")
+plt.scatter(np.sqrt(np.diag(Sigma)), mu, c='red', label='Individual Stocks')
+plt.xlabel("Volatility")
+plt.ylabel("Expected Return")
+plt.title("Efficient Frontier")
+plt.legend()
+plt.grid(True)
+st.pyplot(plt)
