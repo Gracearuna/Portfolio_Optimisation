@@ -1,4 +1,4 @@
-# streamlit_portfolio_dashboard_fixed.py
+# streamlit_portfolio_dashboard_fixed_v2.py
 import streamlit as st
 import yfinance as yf
 import pandas as pd
@@ -87,7 +87,7 @@ def predict_returns(returns, n_lags):
     predicted_returns = []
     for ticker in returns.columns:
         y = np.array(y_all_dict[ticker])
-        if len(y) < 2:  # fallback in case too few samples
+        if len(y) < 2:
             predicted_returns.append(returns[ticker].iloc[-1])
         else:
             model = RandomForestRegressor(n_estimators=50, random_state=42)
@@ -175,17 +175,20 @@ st.dataframe(pd.DataFrame({
     'Black-Litterman': w_bl
 }))
 
-# === PLOTS ===
+# === PLOT FUNCTION ===
 def plot_weights(weights_dict, tickers, title):
     fig, ax = plt.subplots(figsize=(12,6))
     n_assets = len(tickers)
     n_portfolios = len(weights_dict)
     width = 0.8 / n_portfolios
     for i, (name, w) in enumerate(weights_dict.items()):
-        w = np.nan_to_num(w)
-        ax.bar(np.arange(n_assets)+i*width, w, width=width, label=name)
+        w = np.array(w).flatten()
+        w = np.nan_to_num(w, nan=0.0)
+        if len(w) != n_assets:
+            w = np.zeros(n_assets)
+        ax.bar(np.arange(n_assets) + i*width, w, width=width, label=name)
     ax.set_xticks(np.arange(n_assets) + width*(n_portfolios-1)/2)
-    ax.set_xticklabels(tickers, rotation=45)
+    ax.set_xticklabels(tickers, rotation=45, ha="right")
     ax.set_ylabel("Weight")
     ax.set_title(title)
     ax.legend()
@@ -197,7 +200,9 @@ plot_weights({'Equal Weight': w_eq, 'MVO': w_mvo, 'Max Sharpe': w_sharpe, 'BL': 
 daily_returns = returns
 cumulative_dict = {}
 for name, w in zip(['Equal','MVO','Sharpe','BL'], [w_eq,w_mvo,w_sharpe,w_bl]):
-    cumulative_dict[name] = np.exp(np.log1p(daily_returns.values @ w).cumsum())
+    port_ret = daily_returns.values @ w
+    cumulative_dict[name] = np.exp(np.log1p(port_ret).cumsum())
+
 plt.figure(figsize=(12,6))
 for name, cum in cumulative_dict.items():
     plt.plot(daily_returns.index, cum, label=name)
@@ -211,8 +216,9 @@ st.pyplot(plt)
 # === ROLLING METRICS ===
 plt.figure(figsize=(12,6))
 for name, w in zip(['Equal','MVO','Sharpe','BL'], [w_eq,w_mvo,w_sharpe,w_bl]):
-    rolling_vol = (np.log1p(daily_returns.values @ w).rolling(window).std()) * np.sqrt(FREQ_MAP[frequency]['rf_divisor'])
-    plt.plot(daily_returns.index, rolling_vol, label=name)
+    port_ret = pd.Series(daily_returns.values @ w, index=daily_returns.index)
+    rolling_vol = port_ret.rolling(window).std() * np.sqrt(FREQ_MAP[frequency]['rf_divisor'])
+    plt.plot(port_ret.index, rolling_vol, label=name)
 plt.title(f"Rolling {window}-Period Volatility")
 plt.xlabel("Date")
 plt.ylabel("Volatility")
@@ -222,9 +228,9 @@ st.pyplot(plt)
 
 plt.figure(figsize=(12,6))
 for name, w in zip(['Equal','MVO','Sharpe','BL'], [w_eq,w_mvo,w_sharpe,w_bl]):
-    rolling_sharpe = (np.log1p(daily_returns.values @ w).rolling(window).mean()) / \
-                     (np.log1p(daily_returns.values @ w).rolling(window).std()) * np.sqrt(FREQ_MAP[frequency]['rf_divisor'])
-    plt.plot(daily_returns.index, rolling_sharpe, label=name)
+    port_ret = pd.Series(daily_returns.values @ w, index=daily_returns.index)
+    rolling_sharpe = port_ret.rolling(window).mean() / port_ret.rolling(window).std() * np.sqrt(FREQ_MAP[frequency]['rf_divisor'])
+    plt.plot(port_ret.index, rolling_sharpe, label=name)
 plt.title(f"Rolling {window}-Period Sharpe Ratio")
 plt.xlabel("Date")
 plt.ylabel("Sharpe Ratio")
@@ -233,7 +239,7 @@ plt.grid(True)
 st.pyplot(plt)
 
 # === PORTFOLIO CORRELATION ===
-daily_portfolio_returns = pd.DataFrame({name: np.log1p(daily_returns.values @ w) for name, w in zip(['Equal','MVO','Sharpe','BL'], [w_eq,w_mvo,w_sharpe,w_bl])}, index=daily_returns.index)
+daily_portfolio_returns = pd.DataFrame({name: daily_returns.values @ w for name, w in zip(['Equal','MVO','Sharpe','BL'], [w_eq,w_mvo,w_sharpe,w_bl])}, index=daily_returns.index)
 st.subheader("Portfolio Daily Returns Correlation")
 st.dataframe(daily_portfolio_returns.corr())
 plt.figure(figsize=(8,6))
