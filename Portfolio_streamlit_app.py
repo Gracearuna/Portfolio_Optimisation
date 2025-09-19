@@ -141,15 +141,19 @@ def optimize_portfolio(mu, Sigma, rf, tickers, max_variance=0.0002):
 w_eq, ret_eq, vol_eq, sharpe_eq = equal_weight_portfolio(mu, Sigma, rf)
 weights_mvo, weights_sharpe = optimize_portfolio(mu, Sigma, rf, tickers)
 
-# --- Display Portfolio Weights ---
-st.subheader("Portfolio Weights")
+# --- Display Portfolio Weights (formatted as %) ---
 df_weights = pd.DataFrame({
     "Ticker": tickers,
     "Equal Weight": w_eq,
     "MVO": weights_mvo,
     "Max Sharpe": weights_sharpe
 })
-st.dataframe(df_weights.style.format("{:.2%}"))
+df_weights_display = df_weights.copy()
+for col in ["Equal Weight", "MVO", "Max Sharpe"]:
+    df_weights_display[col] = df_weights_display[col].apply(lambda x: f"{x:.2%}")
+
+st.subheader("Portfolio Weights")
+st.dataframe(df_weights_display)
 
 # --- Cumulative Returns Simulation ---
 daily_log_returns = returns
