@@ -8,10 +8,11 @@ from sklearn.covariance import LedoitWolf
 import cvxpy as cp
 from scipy.optimize import minimize
 import matplotlib.pyplot as plt
+import seaborn as sns
 import pandas_datareader.data as web
 from datetime import date
 
-st.set_page_config(page_title="Portfolio Dashboard", layout="wide")
+st.set_page_config(page_title="Portfolio Optimization Dashboard", layout="wide")
 
 # ---------------------------
 # Sidebar Controls
@@ -31,6 +32,7 @@ n_lags = st.sidebar.slider("ML Lag Period", 1, 5, 2)
 max_variance = st.sidebar.number_input("Max Variance (MVO)", 0.0001, 0.01, 0.0002, format="%.6f")
 tau = st.sidebar.number_input("BL τ", 0.01, 1.0, 0.2, format="%.4f")
 omega_scalar = st.sidebar.number_input("BL Ω Scalar", 0.01, 1.0, 0.1, format="%.4f")
+rolling_window_days = st.sidebar.slider("Rolling Window (days)", 10, 126, 21)
 
 # ---------------------------
 # Helper Functions
@@ -113,6 +115,24 @@ def black_litterman(mu_view, Sigma, rf, tickers, returns, tau, omega):
     cp.Problem(cp.Maximize(ret - delta*risk), [cp.sum(w)==1,w>=0]).solve(solver=cp.SCS, verbose=False)
     return mu_post, np.nan_to_num(w.value)
 
+def get_portfolio_perf(weights, mu, Sigma, rf):
+    ret = float(weights @ mu)
+    vol = float(np.sqrt(weights.T @ Sigma @ weights))
+    sharpe = (ret - rf)/(vol + 1e-12)
+    return ret, vol, sharpe
+
+def efficient_frontier(mu, Sigma, points=100):
+    n = len(mu)
+    frontier_vols, frontier_rets = [], np.linspace(min(mu), max(mu), points)
+    for target in frontier_rets:
+        res = minimize(lambda w: np.sqrt(w.T@Sigma@w),
+                       x0=np.repeat(1/n,n),
+                       bounds=[(0,1)]*n,
+                       constraints=[{'type':'eq','fun': lambda w: np.sum(w)-1},
+                                    {'type':'eq','fun': lambda w, t=target: np.dot(w, mu)-t}])
+        frontier_vols.append(res.fun if res.success else np.nan)
+    return frontier_rets, np.array(frontier_vols)
+
 # ---------------------------
 # Data Pipeline
 # ---------------------------
@@ -120,7 +140,8 @@ if not tickers: st.warning("Select at least one ticker."); st.stop()
 prices = download_prices(tickers, start, end)
 if prices.empty: st.error("No price data returned."); st.stop()
 returns = resample_returns(prices, frequency)
-rf_annual = get_rf(start, end); rf = rf_annual / {'daily':252,'weekly':52,'monthly':12}[frequency]
+rf_annual = get_rf(start, end)
+rf = rf_annual / {'daily':252,'weekly':52,'monthly':12}[frequency]
 
 mu = predict_mu(returns, n_lags)
 Sigma = LedoitWolf().fit(returns).covariance_
@@ -131,24 +152,108 @@ mu_bl, w_bl = black_litterman(mu, Sigma, rf, tickers, returns, tau, omega_scalar
 portfolios = {"Equal": w_eq, "MVO": w_mvo, "Max Sharpe": w_sharpe, "BL": w_bl}
 
 # ---------------------------
-# Portfolio Plots
+# Tabs
 # ---------------------------
-st.subheader("Portfolio Weights Comparison")
-fig, ax = plt.subplots(figsize=(12,5))
-for name, w in portfolios.items():
-    ax.bar(np.arange(len(tickers))+0.2*list(portfolios.keys()).index(name), w, width=0.2, label=name)
-ax.set_xticks(np.arange(len(tickers))); ax.set_xticklabels(tickers, rotation=45)
-ax.set_ylabel("Weights"); ax.set_title("Portfolio Weights"); ax.legend(); ax.grid(True)
-st.pyplot(fig)
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+    ["Weights","Efficient Frontier","Cumulative Returns & Drawdowns","Performance Metrics","Rolling Volatility & Sharpe","Correlation Heatmap"]
+)
 
-st.subheader("Cumulative Returns & Drawdowns")
-daily_port = pd.DataFrame({name: returns.values @ w for name, w in portfolios.items()}, index=returns.index)
-cumulative = np.exp(daily_port.cumsum())
-fig2, ax2 = plt.subplots(figsize=(12,6))
-for col in cumulative.columns:
-    series = cumulative[col]; running_max = series.cummax(); drawdown = series/running_max-1
-    ax2.plot(series.index, series, label=col)
-    ax2.fill_between(series.index, series, running_max, where=drawdown<0, alpha=0.2)
-ax2.set_title("Cumulative Returns with Drawdowns"); ax2.set_xlabel("Date"); ax2.set_ylabel("Cumulative Return")
-ax2.grid(True); ax2.legend()
-st.pyplot(fig2)
+# Tab 1: Portfolio Weights
+with tab1:
+    st.subheader("Optimized Portfolio Weights")
+    df_w = pd.DataFrame({ "Ticker": tickers })
+    for name, w in portfolios.items(): df_w[name] = w
+    st.dataframe(df_w.set_index("Ticker"))
+    st.download_button("Download Weights CSV", df_w.to_csv(index=False).encode(), "weights.csv")
+
+    fig, ax = plt.subplots(figsize=(12,5))
+    for i,(name,w) in enumerate(portfolios.items()):
+        ax.bar(np.arange(len(tickers))+0.2*i, w, width=0.2, label=name)
+    ax.set_xticks(np.arange(len(tickers))); ax.set_xticklabels(tickers, rotation=45)
+    ax.set_ylabel("Weight"); ax.set_title("Portfolio Weights"); ax.legend(); ax.grid(True)
+    st.pyplot(fig)
+
+# Tab 2: Efficient Frontier
+with tab2:
+    st.subheader("Efficient Frontier & Random Portfolios")
+    n = len(mu)
+    Sigma_psd = _nearest_psd(Sigma)
+    num_port = 2000
+    results = np.zeros((3, num_port))
+    for i in range(num_port):
+        w = np.random.dirichlet(np.ones(n))
+        r, v, s = get_portfolio_perf(w, mu, Sigma_psd, rf)
+        results[:, i] = [r, v, s]
+    frontier_rets, frontier_vols = efficient_frontier(mu, Sigma_psd)
+    fig, ax = plt.subplots(figsize=(10,6))
+    sc = ax.scatter(results[1,:], results[0,:], c=results[2,:], cmap='viridis', alpha=0.5, label='Random Portfolios')
+    ax.plot(frontier_vols, frontier_rets, 'r--', lw=2, label='Efficient Frontier')
+    for name,w in portfolios.items():
+        r,v,s = get_portfolio_perf(w, mu, Sigma_psd, rf)
+        ax.scatter(v,r,marker='X',s=160,label=f"{name} (Sharpe: {s:.2f})")
+    ax.set_xlabel("Volatility"); ax.set_ylabel("Expected Return"); ax.set_title(f"{frequency.title()} Efficient Frontier")
+    ax.grid(True); ax.legend(); cbar=plt.colorbar(sc); cbar.set_label("Sharpe Ratio")
+    st.pyplot(fig)
+
+# Tab 3: Cumulative Returns & Drawdowns
+with tab3:
+    st.subheader("Cumulative Returns & Drawdowns")
+    daily_port = pd.DataFrame({name: returns.values @ w for name,w in portfolios.items()}, index=returns.index)
+    cumulative = np.exp(daily_port.cumsum())
+    fig, ax = plt.subplots(figsize=(12,6))
+    for col in cumulative.columns:
+        series = cumulative[col]; running_max = series.cummax(); drawdown = series/running_max-1
+        ax.plot(series.index, series, label=col)
+        ax.fill_between(series.index, series, running_max, where=drawdown<0, alpha=0.2)
+    ax.set_title("Cumulative Returns with Drawdowns"); ax.set_xlabel("Date"); ax.set_ylabel("Cumulative Return")
+    ax.grid(True); ax.legend()
+    st.pyplot(fig)
+    st.session_state['daily_port'] = daily_port
+
+# Tab 4: Performance Metrics
+with tab4:
+    st.subheader("Performance Metrics")
+    if 'daily_port' not in st.session_state: st.info("Run backtest first."); st.stop()
+    daily_df = st.session_state['daily_port']
+    metrics = {}
+    def max_dd(series): return float((series/series.cummax()-1).min())
+    def cagr_log(logrets, td=252): return float(np.exp(logrets.sum()/max(len(logrets)/td,1e-12))-1)
+    def ann_vol(logrets, td=252): return float(logrets.std()*np.sqrt(td))
+    def sharpe_log(logrets, rf, td=252): return float(np.sqrt(td)*(logrets - rf/td).mean() / (logrets.std()+1e-12))
+    for name in daily_df.columns:
+        series = daily_df[name]; cum = np.exp(series.cumsum())
+        metrics[name] = {"Max Drawdown": max_dd(cum),"CAGR": cagr_log(series),
+                         "Volatility": ann_vol(series),"Sharpe": sharpe_log(series, rf_annual)}
+    df_metrics = pd.DataFrame(metrics).T
+    st.dataframe(df_metrics.style.format({"Max Drawdown":"{:.2%}","CAGR":"{:.2%}","Volatility":"{:.2%}","Sharpe":"{:.2f}"}))
+    st.download_button("Download Metrics CSV", df_metrics.to_csv().encode(), "metrics.csv")
+
+# Tab 5: Rolling Volatility & Sharpe
+with tab5:
+    st.subheader("Rolling Volatility & Sharpe")
+    window = rolling_window_days
+    fig, ax = plt.subplots(figsize=(12,5))
+    for name in daily_df.columns:
+        ax.plot(daily_df[name].rolling(window).std()*np.sqrt(252), label=name)
+    ax.set_title(f"Rolling {window}-Day Annualized Volatility"); ax.set_xlabel("Date"); ax.set_ylabel("Volatility")
+    ax.grid(True); ax.legend()
+    st.pyplot(fig)
+    fig, ax = plt.subplots(figsize=(12,5))
+    for name in daily_df.columns:
+        rolling_mean = daily_df[name].rolling(window).mean()
+        rolling_std = daily_df[name].rolling(window).std()
+        rolling_sharpe = rolling_mean/(rolling_std+1e-12)*np.sqrt(252)
+        ax.plot(rolling_sharpe, label=name)
+    ax.set_title(f"Rolling {window}-Day Sharpe Ratio"); ax.set_xlabel("Date"); ax.set_ylabel("Sharpe")
+    ax.grid(True); ax.legend()
+    st.pyplot(fig)
+
+# Tab 6: Correlation Heatmap
+with tab6:
+    st.subheader("Correlation Heatmap (Daily Log Returns)")
+    corr = daily_df.corr()
+    fig, ax = plt.subplots(figsize=(8,6))
+    sns.heatmap(corr, annot=True, cmap="coolwarm", fmt=".2f", ax=ax)
+    ax.set_title("Portfolio Daily Returns Correlation")
+    st.pyplot(fig)
+    st.dataframe(corr.style.format("{:.2f}"))
