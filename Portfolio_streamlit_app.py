@@ -1,4 +1,4 @@
-# streamlit_portfolio_dashboard_fixed_v2.py
+# streamlit_portfolio_dashboard_v3.py
 import streamlit as st
 import yfinance as yf
 import pandas as pd
@@ -98,6 +98,15 @@ def predict_returns(returns, n_lags):
 mu = predict_returns(returns, n_lags)
 Sigma = LedoitWolf().fit(returns).covariance_
 
+# === SAFE PORTFOLIO RETURN ===
+def safe_portfolio_return(daily_returns, w):
+    w = np.array(w).flatten()
+    w = np.nan_to_num(w, nan=0.0)
+    n_assets = daily_returns.shape[1]
+    if len(w) != n_assets:
+        w = np.zeros(n_assets)
+    return daily_returns.values @ w
+
 # === PORTFOLIO FUNCTIONS ===
 def equal_weight_portfolio(n):
     return np.repeat(1/n, n)
@@ -175,7 +184,7 @@ st.dataframe(pd.DataFrame({
     'Black-Litterman': w_bl
 }))
 
-# === PLOT FUNCTION ===
+# === PLOT WEIGHTS ===
 def plot_weights(weights_dict, tickers, title):
     fig, ax = plt.subplots(figsize=(12,6))
     n_assets = len(tickers)
@@ -197,15 +206,14 @@ def plot_weights(weights_dict, tickers, title):
 plot_weights({'Equal Weight': w_eq, 'MVO': w_mvo, 'Max Sharpe': w_sharpe, 'BL': w_bl}, tickers, "Portfolio Weights Comparison")
 
 # === CUMULATIVE RETURNS ===
-daily_returns = returns
 cumulative_dict = {}
 for name, w in zip(['Equal','MVO','Sharpe','BL'], [w_eq,w_mvo,w_sharpe,w_bl]):
-    port_ret = daily_returns.values @ w
+    port_ret = safe_portfolio_return(returns, w)
     cumulative_dict[name] = np.exp(np.log1p(port_ret).cumsum())
 
 plt.figure(figsize=(12,6))
 for name, cum in cumulative_dict.items():
-    plt.plot(daily_returns.index, cum, label=name)
+    plt.plot(returns.index, cum, label=name)
 plt.title("Cumulative Portfolio Returns")
 plt.xlabel("Date")
 plt.ylabel("Cumulative Return")
@@ -216,10 +224,10 @@ st.pyplot(plt)
 # === ROLLING METRICS ===
 plt.figure(figsize=(12,6))
 for name, w in zip(['Equal','MVO','Sharpe','BL'], [w_eq,w_mvo,w_sharpe,w_bl]):
-    port_ret = pd.Series(daily_returns.values @ w, index=daily_returns.index)
-    rolling_vol = port_ret.rolling(window).std() * np.sqrt(FREQ_MAP[frequency]['rf_divisor'])
-    plt.plot(port_ret.index, rolling_vol, label=name)
-plt.title(f"Rolling {window}-Period Volatility")
+    port_ret = pd.Series(safe_portfolio_return(returns, w), index=returns.index)
+    rolling_vol = port_ret.rolling(window).std() * np.sqrt(252)
+    plt.plot(rolling_vol, label=name)
+plt.title(f"Rolling {window}-Day Volatility")
 plt.xlabel("Date")
 plt.ylabel("Volatility")
 plt.legend()
@@ -228,10 +236,10 @@ st.pyplot(plt)
 
 plt.figure(figsize=(12,6))
 for name, w in zip(['Equal','MVO','Sharpe','BL'], [w_eq,w_mvo,w_sharpe,w_bl]):
-    port_ret = pd.Series(daily_returns.values @ w, index=daily_returns.index)
-    rolling_sharpe = port_ret.rolling(window).mean() / port_ret.rolling(window).std() * np.sqrt(FREQ_MAP[frequency]['rf_divisor'])
-    plt.plot(port_ret.index, rolling_sharpe, label=name)
-plt.title(f"Rolling {window}-Period Sharpe Ratio")
+    port_ret = pd.Series(safe_portfolio_return(returns, w), index=returns.index)
+    rolling_sharpe = (port_ret.rolling(window).mean()/port_ret.rolling(window).std()) * np.sqrt(252)
+    plt.plot(rolling_sharpe, label=name)
+plt.title(f"Rolling {window}-Day Sharpe Ratio")
 plt.xlabel("Date")
 plt.ylabel("Sharpe Ratio")
 plt.legend()
@@ -239,10 +247,6 @@ plt.grid(True)
 st.pyplot(plt)
 
 # === PORTFOLIO CORRELATION ===
-daily_portfolio_returns = pd.DataFrame({name: daily_returns.values @ w for name, w in zip(['Equal','MVO','Sharpe','BL'], [w_eq,w_mvo,w_sharpe,w_bl])}, index=daily_returns.index)
+daily_df = pd.DataFrame({name: safe_portfolio_return(returns, w) for name,w in zip(['Equal','MVO','Sharpe','BL'], [w_eq,w_mvo,w_sharpe,w_bl])})
 st.subheader("Portfolio Daily Returns Correlation")
-st.dataframe(daily_portfolio_returns.corr())
-plt.figure(figsize=(8,6))
-sns.heatmap(daily_portfolio_returns.corr(), annot=True, cmap='coolwarm')
-plt.title("Portfolio Daily Returns Correlation")
-st.pyplot(plt)
+st.dataframe(daily_df.corr())
