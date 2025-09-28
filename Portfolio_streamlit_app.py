@@ -1,4 +1,6 @@
-# portfolio_streamlit_app.py
+# ===============================
+# Streamlit Dashboard for Portfolio Optimization
+# ===============================
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -14,111 +16,99 @@ from models import (
     equal_weight_portfolio,
     black_litterman,
     backtest_annual,
-    performance_metrics_full,
-    plot_efficient_frontier
+    performance_metrics_full
 )
 
 st.set_page_config(page_title="Portfolio Optimization Dashboard", layout="wide")
-st.title("📈 Portfolio Optimization & Backtest Dashboard")
 
 # ===============================
 # Sidebar Inputs
 # ===============================
 st.sidebar.header("Settings")
 frequency = st.sidebar.selectbox("Data Frequency", ["daily", "weekly", "monthly"], index=1)
-n_lags = st.sidebar.slider("LSTM lookback (lags)", 1, 12, 3)
-lookback = st.sidebar.slider("Backtest Lookback Period (periods)", 1, 24, 12)
-
-tickers = st.sidebar.text_area(
-    "Tickers (comma-separated)", 
-    "JPM,GS,AAPL,MSFT,NVDA,GOOGL,META,AMZN,HD,KO,XOM,CVX,UNH,PFE,CAT,UNP,NFLX,DIS,NEE,PLD"
-).replace(" ", "").split(",")
-
-start = st.sidebar.date_input("Start Date", pd.to_datetime("2020-06-01"))
-end = st.sidebar.date_input("End Date", pd.to_datetime("2025-06-01"))
+n_lags = st.sidebar.slider("LSTM lookback lags", 1, 12, 3)
+lookback = st.sidebar.slider("Backtest lookback (periods)", 1, 24, 12)
+n_random = st.sidebar.slider("Random Portfolios for Efficient Frontier", 100, 5000, 3000)
 
 # ===============================
-# Load Data
+# Load or Download Data
 # ===============================
+tickers = [
+    "JPM","GS","AAPL","MSFT","NVDA","GOOGL","META",
+    "AMZN","HD","KO","XOM","CVX","UNH","PFE",
+    "CAT","UNP","NFLX","DIS","NEE","PLD"
+]
+
 @st.cache_data
-def load_data(tickers, start, end):
-    df = yf.download(tickers, start=start, end=end, auto_adjust=True)["Close"]
+def load_stock_data(tickers):
+    df = yf.download(tickers, start="2020-06-01", end="2025-06-01", auto_adjust=True)["Close"]
     return df
 
-stock_data = load_data(tickers, start, end)
-st.subheader("Stock Data Preview")
+stock_data = load_stock_data(tickers)
+st.subheader("Sample Stock Prices")
 st.dataframe(stock_data.tail())
 
 # ===============================
-# Resample Returns
+# Resample & Compute Returns
 # ===============================
-FREQ_MAP = {'daily': None, 'weekly': 'W-FRI', 'monthly': 'M'}
-rf_divisor_map = {'daily': 252, 'weekly': 52, 'monthly': 12}
+FREQUENCY_MAP = {'daily': {'resample': None, 'rf_divisor': 252},
+                 'weekly': {'resample': 'W-FRI', 'rf_divisor': 52},
+                 'monthly': {'resample': 'M', 'rf_divisor': 12}}
 
-def resample_returns(stock_data, freq):
-    rule = FREQ_MAP[freq]
+def resample_returns(stock_data, freq_key):
+    rule = FREQUENCY_MAP[freq_key]['resample']
     if rule:
         stock_data = stock_data.resample(rule).last()
     returns = np.log(stock_data / stock_data.shift(1)).dropna()
     return returns
 
 returns = resample_returns(stock_data, frequency)
-st.subheader(f"{frequency.capitalize()} Returns Preview")
+st.subheader(f"{frequency.title()} Returns")
 st.dataframe(returns.tail())
 
 # ===============================
 # Run Backtest
 # ===============================
-with st.spinner("Running annual backtest..."):
-    cum_returns_df = backtest_annual(returns, n_lags=n_lags, lookback=lookback)
+st.subheader("Backtest Portfolio Performance")
+cum_returns_df = backtest_annual(returns, n_lags=n_lags, lookback=lookback)
 
-# ===============================
-# Plot Cumulative Returns with Drawdown
-# ===============================
-st.subheader("Cumulative Returns with Drawdown")
-plt.figure(figsize=(14,8))
-
+# Plot cumulative returns
+fig, ax = plt.subplots(figsize=(12,6))
 for col in cum_returns_df.columns:
+    ax.plot(cum_returns_df.index, cum_returns_df[col], label=col, linewidth=2)
+    # Drawdown shading
     cum = cum_returns_df[col]
     rolling_max = cum.cummax()
-    drawdown = rolling_max - cum
+    ax.fill_between(cum_returns_df.index, cum, rolling_max, color='red', alpha=0.1)
 
-    # Plot cumulative return line
-    plt.plot(cum_returns_df.index, cum, label=col, linewidth=2)
-    # Drawdown shading
-    plt.fill_between(cum_returns_df.index, cum, rolling_max, color='red', alpha=0.1)
+ax.set_title("Portfolio Cumulative Returns with Drawdowns")
+ax.set_xlabel("Date")
+ax.set_ylabel("Cumulative Return")
+ax.grid(True, linestyle='--', alpha=0.5)
+ax.legend()
+st.pyplot(fig)
 
-plt.title("Portfolio Cumulative Returns with Drawdown", fontsize=16)
-plt.xlabel("Date", fontsize=14)
-plt.ylabel("Cumulative Return", fontsize=14)
-plt.grid(True, linestyle='--', alpha=0.5)
-plt.legend(fontsize=12)
-plt.tight_layout()
-st.pyplot(plt.gcf())
-
-# ===============================
 # Performance Metrics
-# ===============================
 metrics_df = performance_metrics_full(cum_returns_df)
-st.subheader("Performance Metrics")
+st.subheader(f"Portfolio Performance Metrics ({frequency.capitalize()})")
 st.dataframe(metrics_df)
 
 # ===============================
 # Efficient Frontier
 # ===============================
 st.subheader("Efficient Frontier")
+
+# Compute predicted returns and covariance
 mu = predict_returns_lstm(returns, n_lags=n_lags)
 Sigma = LedoitWolf().fit(returns).covariance_
 
-# Risk-free rate
-treasury = web.DataReader("DGS5", "fred", start, end)
+treasury = web.DataReader("DGS5", "fred", returns.index[0], returns.index[-1])
 rf_annual = treasury["DGS5"].mean()/100
-rf = rf_annual / rf_divisor_map[frequency]
+rf = rf_annual / FREQUENCY_MAP[frequency]['rf_divisor']
 
-# Compute portfolios
-weights_mvo, ret_mvo, vol_mvo, sharpe_mvo, weights_sharpe, ret_sharpe, vol_sharpe, sharpe_sharpe = optimize_portfolio(mu, Sigma, rf, tickers)
+w_mvo, ret_mvo, vol_mvo, sharpe_mvo, w_sharpe, ret_sharpe, vol_sharpe, sharpe_sharpe = optimize_portfolio(mu, Sigma, rf, returns.columns)
 w_eq, ret_eq, vol_eq, sharpe_eq = equal_weight_portfolio(mu, Sigma, rf)
-mu_bl, weights_bl, ret_bl, vol_bl, sharpe_bl = black_litterman(mu, Sigma, rf, tickers, returns)
+mu_bl, w_bl, ret_bl, vol_bl, sharpe_bl = black_litterman(mu, Sigma, rf, returns.columns, returns)
 
 portfolio_metrics = {
     "Equal Weight": (ret_eq, vol_eq, sharpe_eq),
@@ -127,8 +117,54 @@ portfolio_metrics = {
     "Black-Litterman": (ret_bl, vol_bl, sharpe_bl)
 }
 
-ef_summary = plot_efficient_frontier(mu, Sigma, rf, portfolio_metrics, title=f"{frequency.title()} Efficient Frontier")
-st.pyplot(plt.gcf())
+# Plot Efficient Frontier
+def plot_efficient_frontier(mu, Sigma, rf, portfolios, n_random=3000, max_weight=0.3, title="Efficient Frontier"):
+    n = len(mu)
+    np.random.seed(42)
+    results = np.zeros((3, n_random))
+    for i in range(n_random):
+        weights = np.random.dirichlet(np.ones(n))
+        ret = np.dot(weights, mu)
+        vol = np.sqrt(weights.T @ Sigma @ weights)
+        sharpe = (ret - rf)/vol
+        results[:, i] = [ret, vol, sharpe]
 
-st.subheader("Portfolio Metrics")
+    # Compute analytical efficient frontier
+    n_points = 50
+    target_returns = np.linspace(min(mu), max(mu), n_points)
+    ef_returns, ef_vols = [], []
+    for r_target in target_returns:
+        w = cp.Variable(n)
+        portfolio_var = cp.quad_form(w, Sigma)
+        constraints = [cp.sum(w)==1, w>=0, w<=max_weight, mu @ w==r_target]
+        prob = cp.Problem(cp.Minimize(portfolio_var), constraints)
+        prob.solve(solver=cp.SCS, verbose=False)
+        if w.value is not None:
+            ef_returns.append(r_target)
+            ef_vols.append(np.sqrt(w.value.T @ Sigma @ w.value))
+
+    # Plot
+    fig, ax = plt.subplots(figsize=(12,6))
+    sc = ax.scatter(results[1,:], results[0,:], c=results[2,:], cmap='viridis', alpha=0.4)
+    plt.colorbar(sc, label='Sharpe Ratio')
+    ax.plot(ef_vols, ef_returns, 'r--', lw=2, label='Efficient Frontier')
+    for label, metrics in portfolios.items():
+        r, v, s = metrics
+        ax.scatter(v, r, marker='X', s=200, label=f"{label} (Sharpe: {s:.3f})")
+    ax.set_xlabel("Volatility (Std Dev)")
+    ax.set_ylabel("Expected Return")
+    ax.set_title(title)
+    ax.grid(True, linestyle='--', alpha=0.5)
+    ax.legend()
+    st.pyplot(fig)
+
+    # Summary
+    summary_list = []
+    for label, metrics in portfolios.items():
+        r, v, s = metrics
+        summary_list.append([label, r, v, s])
+    return pd.DataFrame(summary_list, columns=['Portfolio','Return','Volatility','Sharpe Ratio'])
+
+ef_summary = plot_efficient_frontier(mu, Sigma, rf, portfolio_metrics, n_random=n_random)
+st.subheader("Efficient Frontier Portfolio Summary")
 st.dataframe(ef_summary)
